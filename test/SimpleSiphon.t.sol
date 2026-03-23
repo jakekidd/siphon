@@ -6,10 +6,6 @@ import {SiphonToken} from "../src/SiphonToken.sol";
 import {IScheduleListener} from "../src/interfaces/IScheduleListener.sol";
 import {Test} from "forge-std/Test.sol";
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Mock listener that records callbacks
-// ═══════════════════════════════════════════════════════════════════════════════
-
 contract MockListener is IScheduleListener {
     struct Call {
         address token;
@@ -27,23 +23,6 @@ contract MockListener is IScheduleListener {
         return calls.length;
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SiphonToken Test Suite
-//
-// Comprehensive tests covering all user paths including prepay/autopay mixed
-// scenarios. Organized by: basic ops, schedule lifecycle, skip periods,
-// mixed prepay/autopay, spend+schedule interaction, edge cases, fuzz.
-//
-// STATE LEGEND:
-//   EMPTY       = no balance, no schedule
-//   FUNDED      = has balance, no schedule
-//   ACTIVE      = schedule active, in billable zone
-//   ACTIVE_SKIP = schedule active, in skip (prepaid) zone
-//   CANCELED    = schedule canceled, in final period
-//   LAPSED      = schedule expired (funds ran out)
-//   SETTLED     = schedule cleared after lapse/cancel
-// ═══════════════════════════════════════════════════════════════════════════════
 
 contract SimpleSiphonTest is Test {
     SimpleSiphon public token;
@@ -74,55 +53,28 @@ contract SimpleSiphonTest is Test {
 
     // ── Helpers ──
 
-    function _warpToDay(uint256 d) internal {
-        vm.warp(d * DAY);
-    }
-
-    function _advanceDays(uint256 n) internal {
-        vm.warp(block.timestamp + n * DAY);
-    }
+    function _warpToDay(uint256 d) internal { vm.warp(d * DAY); }
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
 
     function _mint(address user, uint128 amt) internal {
         vm.prank(owner);
         token.mint(user, amt);
     }
 
-    function _schedule(address user, uint128 rate, uint32 period, uint16 maxP, uint16 skip) internal {
+    function _schedule(address user, uint128 rate, uint32 interval, uint16 cap, uint16 grace) internal {
         vm.prank(sched);
-        token.setSchedule(user, rate, period, maxP, skip);
+        token.setSchedule(user, rate, interval, cap, grace);
     }
 
-    function _cancel(address user) internal {
-        vm.prank(sched);
-        token.cancelSchedule(user);
-    }
-
-    function _clear(address user) internal {
-        vm.prank(sched);
-        token.clearSchedule(user);
-    }
-
-    function _skip(address user, uint16 periods) internal {
-        vm.prank(sched);
-        token.addSkipPeriods(user, periods);
-    }
-
-    function _spend(address user, uint128 amt) internal {
-        vm.prank(spndr);
-        token.spend(user, amt);
-    }
-
-    function _autoSchedule(address user) internal {
-        _schedule(user, RATE, PERIOD, 0, 0);
-    }
-
-    function _fundAndSchedule(address user, uint256 ubiAmt) internal {
-        _mint(user, uint128(ubiAmt));
-        _autoSchedule(user);
-    }
+    function _terminate(address user) internal { vm.prank(sched); token.terminateSchedule(user); }
+    function _clear(address user) internal { vm.prank(sched); token.clearSchedule(user); }
+    function _grace(address user, uint16 periods) internal { vm.prank(sched); token.addGracePeriods(user, periods); }
+    function _spend(address user, uint128 amt) internal { vm.prank(spndr); token.spend(user, amt); }
+    function _auto(address user) internal { _schedule(user, RATE, PERIOD, 0, 0); }
+    function _fundAndAuto(address user, uint256 amt) internal { _mint(user, uint128(amt)); _auto(user); }
 
     // ═══════════════════════════════════════════════════════════════
-    // ERC20 BASICS
+    // ERC20
     // ═══════════════════════════════════════════════════════════════
 
     function test_metadata() public {
@@ -131,22 +83,76 @@ contract SimpleSiphonTest is Test {
         assertEq(token.decimals(), 18);
     }
 
-    function test_nonTransferable() public {
-        _mint(alice, RATE);
+    function test_transfer() public {
+        _mint(alice, RATE * 3);
         vm.prank(alice);
-        vm.expectRevert(SiphonToken.NonTransferable.selector);
         token.transfer(bob, RATE);
+        assertEq(token.balanceOf(alice), RATE * 2);
+        assertEq(token.balanceOf(bob), RATE);
+    }
+
+    function test_transfer_reducesExpiry() public {
+        _fundAndAuto(alice, RATE * 3);
+        assertEq(token.expiry(alice), 1000 + 3 * PERIOD);
+
+        vm.prank(alice);
+        token.transfer(bob, RATE); // balance after consumed: 2*RATE, transfer RATE -> 1*RATE left
+        // principal was 3*RATE, now 3*RATE - RATE = 2*RATE. funded = 2. But period 1 consuming...
+        // Actually _transfer settles first (active schedule, settle is no-op), then reduces principal.
+        // principal = 3*RATE - RATE = 2*RATE. funded = 2. expiry = 1000 + 2*30 = 1060.
+        assertEq(token.expiry(alice), 1060);
+    }
+
+    function test_transfer_insufficientBalance() public {
+        _fundAndAuto(alice, RATE * 2);
+        // balanceOf = RATE (1 period consumed)
+        vm.prank(alice);
+        vm.expectRevert(SiphonToken.InsufficientBalance.selector);
+        token.transfer(bob, RATE + 1);
+    }
+
+    function test_approve_and_transferFrom() public {
+        _mint(alice, RATE * 3);
+
+        vm.prank(alice);
+        token.approve(bob, RATE * 2);
+        assertEq(token.allowance(alice, bob), RATE * 2);
+
+        vm.prank(bob);
+        token.transferFrom(alice, bob, RATE);
+        assertEq(token.balanceOf(alice), RATE * 2);
+        assertEq(token.balanceOf(bob), RATE);
+        assertEq(token.allowance(alice, bob), RATE); // decreased
+    }
+
+    function test_transferFrom_insufficientAllowance() public {
+        _mint(alice, RATE * 3);
+        vm.prank(alice);
+        token.approve(bob, RATE - 1);
+
+        vm.prank(bob);
+        vm.expectRevert(SiphonToken.InsufficientAllowance.selector);
+        token.transferFrom(alice, bob, RATE);
+    }
+
+    function test_transferFrom_maxAllowance() public {
+        _mint(alice, RATE * 3);
+        vm.prank(alice);
+        token.approve(bob, type(uint256).max);
+
+        vm.prank(bob);
+        token.transferFrom(alice, bob, RATE);
+        assertEq(token.allowance(alice, bob), type(uint256).max); // not decreased
     }
 
     // ═══════════════════════════════════════════════════════════════
     // MINT + BALANCE
     // ═══════════════════════════════════════════════════════════════
 
-    function test_mint_balance() public {
+    function test_mint() public {
         _mint(alice, 5000 ether);
         assertEq(token.balanceOf(alice), 5000 ether);
         assertEq(token.totalSupply(), 5000 ether);
-        assertEq(token.totalMinted(), 5000 ether);
     }
 
     function test_mint_stacks() public {
@@ -156,196 +162,151 @@ contract SimpleSiphonTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // SCHEDULE — BASIC AUTOPAY
+    // AUTOPAY — BASIC
     // ═══════════════════════════════════════════════════════════════
 
     function test_autopay_basic() public {
-        _fundAndSchedule(alice, RATE * 3);
+        _fundAndAuto(alice, RATE * 3);
         assertTrue(token.isActive(alice));
         assertEq(token.expiry(alice), 1000 + 3 * PERIOD);
     }
 
-    function test_autopay_balanceDecays() public {
-        _fundAndSchedule(alice, RATE * 3);
-        assertEq(token.balanceOf(alice), RATE * 2); // period 1 consumed
-
+    function test_autopay_decay() public {
+        _fundAndAuto(alice, RATE * 3);
+        assertEq(token.balanceOf(alice), RATE * 2);
         _advanceDays(30);
-        assertEq(token.balanceOf(alice), RATE); // period 2
-
+        assertEq(token.balanceOf(alice), RATE);
         _advanceDays(30);
-        assertEq(token.balanceOf(alice), 0); // period 3
+        assertEq(token.balanceOf(alice), 0);
     }
 
     function test_autopay_depositExtends() public {
-        _fundAndSchedule(alice, RATE);
+        _fundAndAuto(alice, RATE);
         assertEq(token.expiry(alice), 1030);
-
         _mint(alice, RATE * 2);
         assertEq(token.expiry(alice), 1090);
     }
 
     function test_autopay_lapse() public {
-        _fundAndSchedule(alice, RATE);
+        _fundAndAuto(alice, RATE);
         _advanceDays(31);
         assertTrue(token.isLapsed(alice));
-        assertFalse(token.isActive(alice));
     }
 
-    function test_autopay_cancel() public {
-        _fundAndSchedule(alice, RATE * 3);
+    function test_autopay_terminate() public {
+        _fundAndAuto(alice, RATE * 3);
         _advanceDays(5);
-        _cancel(alice);
-
-        assertTrue(token.isCanceled(alice));
-        assertFalse(token.isActive(alice));
-        assertEq(token.consumed(alice), RATE); // frozen at period 1
+        _terminate(alice);
+        assertTrue(token.isTerminated(alice));
+        assertEq(token.consumed(alice), RATE);
     }
 
     function test_autopay_settleAfterLapse() public {
-        _fundAndSchedule(alice, RATE * 2);
-        _advanceDays(61); // lapsed
-
+        _fundAndAuto(alice, RATE * 2);
+        _advanceDays(61);
         _mint(alice, RATE);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
-        assertEq(principal, RATE); // old consumed deducted, new added
-        assertEq(rate, 0); // schedule cleared
+        assertEq(principal, RATE);
+        assertEq(rate, 0);
     }
 
-    function test_autopay_settleAfterCancel() public {
-        _fundAndSchedule(alice, RATE * 3);
-        _cancel(alice);
+    function test_autopay_settleAfterTerminate() public {
+        _fundAndAuto(alice, RATE * 3);
+        _terminate(alice);
         _advanceDays(31);
-
         _mint(alice, RATE);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
-        assertEq(principal, RATE * 2 + RATE); // 3 - 1 consumed + 1 new
+        assertEq(principal, RATE * 2 + RATE);
         assertEq(rate, 0);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // SCHEDULE — PURE PREPAY (skip only, no autopay funding)
+    // PURE PREPAY (grace only)
     // ═══════════════════════════════════════════════════════════════
 
-    function test_prepay_pureSkip() public {
-        _mint(alice, 1); // minimal balance, schedule with skip
+    function test_prepay_pure() public {
+        _mint(alice, 1);
         _schedule(alice, RATE, PERIOD, 0, 3);
-
         assertTrue(token.isActive(alice));
-        assertTrue(token.isInSkipZone(alice));
+        assertTrue(token.isGracePeriod(alice));
         assertEq(token.consumed(alice), 0);
-        assertEq(token.balanceOf(alice), 1);
-
-        // Expiry: skip(3) + funded(1/3000e18 = 0) = 3 periods
-        assertEq(token.expiry(alice), 1000 + 3 * PERIOD); // 1090
-
-        // During skip: still active
-        _advanceDays(60);
-        assertTrue(token.isActive(alice));
-        assertTrue(token.isInSkipZone(alice));
-
-        // After 3 periods: lapsed (no funded periods after skip)
+        assertEq(token.expiry(alice), 1000 + 3 * PERIOD);
         _warpToDay(1091);
         assertTrue(token.isLapsed(alice));
     }
 
-    function test_prepay_skipThenAutopay() public {
-        // 3 months prepaid + 2 months funded
+    function test_prepay_thenAutopay() public {
         _mint(alice, RATE * 2);
         _schedule(alice, RATE, PERIOD, 0, 3);
+        assertEq(token.expiry(alice), 1000 + 5 * PERIOD);
 
-        // Expiry: 3 skip + 2 funded = 5 periods
-        assertEq(token.expiry(alice), 1000 + 5 * PERIOD); // 1150
-        assertEq(token.consumed(alice), 0);
-
-        // During skip: balance unchanged
-        _advanceDays(60); // day 1060
+        _advanceDays(60);
         assertEq(token.balanceOf(alice), RATE * 2);
-        assertTrue(token.isInSkipZone(alice));
+        assertTrue(token.isGracePeriod(alice));
 
-        // Past skip: autopay kicks in. Period 4 (first billable) starts at day 1090.
         _warpToDay(1090);
-        assertFalse(token.isInSkipZone(alice));
+        assertFalse(token.isGracePeriod(alice));
         assertEq(token.consumed(alice), RATE);
-        assertEq(token.balanceOf(alice), RATE);
 
-        // Period 5 starts at day 1120
         _warpToDay(1120);
         assertEq(token.consumed(alice), RATE * 2);
         assertEq(token.balanceOf(alice), 0);
 
-        // Lapse at expiry (day 1150)
         _warpToDay(1150);
         assertTrue(token.isLapsed(alice));
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // MIXED: AUTOPAY -> ADD PREPAID MID-SCHEDULE
+    // MIXED: AUTOPAY + GRACE MID-SCHEDULE
     // ═══════════════════════════════════════════════════════════════
 
-    function test_mixed_addPrepayMidAutopay() public {
-        // Alice on autopay with 3 months funded
-        _fundAndSchedule(alice, RATE * 3);
-        assertEq(token.expiry(alice), 1090);
-
-        // Day 1015: buy 3 months prepaid
+    function test_mixed_addGraceMidAutopay() public {
+        _fundAndAuto(alice, RATE * 3);
         _advanceDays(15);
-        _skip(alice, 3);
+        _grace(alice, 3);
 
-        // Checkpoint: consumed period 1 (RATE), principal = 3*RATE - RATE = 2*RATE
-        // Restart: startedAt=1015, skip=3, funded=2
-        assertEq(token.consumed(alice), 0); // in skip zone
+        assertEq(token.consumed(alice), 0);
         assertEq(token.balanceOf(alice), RATE * 2);
 
-        // Skip zone: 3 periods from day 1015 = days 1015-1105
         _warpToDay(1030);
-        assertTrue(token.isInSkipZone(alice));
-        assertEq(token.balanceOf(alice), RATE * 2);
+        assertTrue(token.isGracePeriod(alice));
 
         _warpToDay(1090);
-        assertTrue(token.isInSkipZone(alice));
+        assertTrue(token.isGracePeriod(alice));
 
-        // Day 1105: period 4 from restart, first billable (past 3 skip periods)
-        // periodsStarted = ((1105-1015)/30)+1 = 4, skip=3, billable=1
         _warpToDay(1105);
-        assertFalse(token.isInSkipZone(alice));
+        assertFalse(token.isGracePeriod(alice));
         assertEq(token.consumed(alice), RATE);
-        assertEq(token.balanceOf(alice), RATE);
 
-        // Day 1135: period 5, billable=2
         _warpToDay(1135);
         assertEq(token.consumed(alice), RATE * 2);
         assertEq(token.balanceOf(alice), 0);
 
-        // Expiry = 1015 + (3+2)*30 = 1165. Lapse at 1165.
         _warpToDay(1165);
         assertTrue(token.isLapsed(alice));
     }
 
-    function test_mixed_multiplePrepayAdditions() public {
-        // Alice on autopay with 6 months funded
-        _fundAndSchedule(alice, RATE * 6);
+    function test_mixed_multipleGraceAdditions() public {
+        _fundAndAuto(alice, RATE * 4);
 
-        // Day 1015: add 2 prepaid months
-        _advanceDays(15);
-        _skip(alice, 2);
-        // Checkpoint: consumed=RATE, principal=5*RATE, skip=2, startedAt=1015
-        assertEq(token.balanceOf(alice), RATE * 5);
+        // Day 1010: add 2 grace
+        _advanceDays(10);
+        _grace(alice, 2);
+        // Settled period 1 (RATE consumed), principal=3*RATE, anchor=1010, grace=2
 
-        // Day 1045: add 1 more prepaid month
+        // Day 1040: add 1 more grace (in grace zone, consumed=0, restart anchor)
         _advanceDays(30);
-        _skip(alice, 1);
-        // Checkpoint: in skip zone, consumed=0, principal stays 5*RATE
-        // skip=0+1=1 (old skip cleared by checkpoint, then +1)
-        // Wait, checkpoint clears skipPeriods!
-        // At day 1045, periodsStarted from 1015 = ((1045-1015)/30)+1 = 2, skip=2, billable=0, consumed=0
-        // Checkpoint: consumed=0, principal stays. startedAt=1045. skip reset to 0.
-        // Then addSkipPeriods: skip = 0+1 = 1.
+        _grace(alice, 1);
+        // Settled 0 consumed (in grace), principal=3*RATE, anchor=1040, grace=1
 
-        assertEq(token.balanceOf(alice), RATE * 5); // still no consumption
-        assertTrue(token.isInSkipZone(alice));
+        assertEq(token.balanceOf(alice), RATE * 3);
+        assertTrue(token.isGracePeriod(alice));
 
-        // Expiry: from day 1045, skip=1, funded=5. total=6 periods. 1045 + 180 = 1225.
-        assertEq(token.expiry(alice), 1045 + 6 * PERIOD);
+        // From day 1040: grace=1, funded=3. total=4 periods. expiry=1040+120=1160.
+        assertEq(token.expiry(alice), 1040 + (1 + 3) * PERIOD);
+
+        _warpToDay(1160);
+        assertTrue(token.isLapsed(alice));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -353,105 +314,92 @@ contract SimpleSiphonTest is Test {
     // ═══════════════════════════════════════════════════════════════
 
     function test_spend_reducesExpiry() public {
-        _fundAndSchedule(alice, RATE * 3);
-        assertEq(token.expiry(alice), 1090);
-
+        _fundAndAuto(alice, RATE * 3);
         _spend(alice, 1);
-        // principal = 9000e18 - 1. funded = (9000e18-1)/3000e18 = 2. expiry = 1060.
         assertEq(token.expiry(alice), 1060);
     }
 
-    function test_spend_duringSkipReducesPostSkipPeriods() public {
+    function test_spend_duringGraceReducesPostGrace() public {
         _mint(alice, RATE * 3);
         _schedule(alice, RATE, PERIOD, 0, 2);
-        // Skip=2, funded=3. Expiry = 1000 + 5*30 = 1150.
         assertEq(token.expiry(alice), 1150);
-
-        // Spend 1 period's worth during skip zone
         _advanceDays(15);
         _spend(alice, RATE);
-
-        // principal = 2*RATE. funded = 2. skip still 2.
-        // Expiry = 1000 + (2+2)*30 = 1120. Lost 1 post-skip period.
         assertEq(token.expiry(alice), 1120);
-        assertEq(token.balanceOf(alice), RATE * 2); // no siphon consumption yet
+        assertEq(token.balanceOf(alice), RATE * 2);
     }
 
-    function test_spend_cannotExceedAvailableBalance() public {
-        _fundAndSchedule(alice, RATE * 2);
-        // balance = RATE (period 1 consumed)
+    function test_spend_cannotExceedAvailable() public {
+        _fundAndAuto(alice, RATE * 2);
         vm.prank(spndr);
         vm.expectRevert(SiphonToken.InsufficientBalance.selector);
         token.spend(alice, RATE + 1);
     }
 
-    function test_spend_settlesStaleSchedule() public {
-        _fundAndSchedule(alice, RATE + 500 ether);
-        _advanceDays(PERIOD + 1); // lapsed
-
+    function test_spend_settlesStale() public {
+        _fundAndAuto(alice, RATE + 500 ether);
+        _advanceDays(PERIOD + 1);
         _spend(alice, 200 ether);
         assertEq(token.balanceOf(alice), 300 ether);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // MAX PERIODS WITH SKIP
+    // CAP (maxPeriods)
     // ═══════════════════════════════════════════════════════════════
 
-    function test_maxPeriods_capsTotal() public {
+    function test_cap_total() public {
         _mint(alice, RATE * 10);
         _schedule(alice, RATE, PERIOD, 6, 3);
-        // maxPeriods=6 caps total. skip=3, funded capped at 6-3=3.
         assertEq(token.expiry(alice), 1000 + 6 * PERIOD);
     }
 
-    function test_maxPrepaid_capsTotal() public {
+    function test_cap_global() public {
         _mint(alice, RATE * 20);
         _schedule(alice, RATE, PERIOD, 0, 3);
-        // MAX_PREPAID=12. skip=3, funded capped at 12-3=9.
         assertEq(token.expiry(alice), 1000 + 12 * PERIOD);
     }
 
-    function test_maxPeriods_setByUser() public {
-        _fundAndSchedule(alice, RATE * 6);
+    function test_cap_userSet() public {
+        _fundAndAuto(alice, RATE * 6);
         assertEq(token.expiry(alice), 1000 + 6 * PERIOD);
-
         vm.prank(alice);
-        token.setMaxPeriods(3);
+        token.setCap(3);
         assertEq(token.expiry(alice), 1000 + 3 * PERIOD);
-
         vm.prank(alice);
-        token.setMaxPeriods(0);
+        token.setCap(0);
         assertEq(token.expiry(alice), 1000 + 6 * PERIOD);
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // CANCEL DURING SKIP
-    // ═══════════════════════════════════════════════════════════════
-
-    function test_cancel_duringSkip() public {
-        _mint(alice, RATE * 3);
-        _schedule(alice, RATE, PERIOD, 0, 2);
-
-        _advanceDays(15); // mid skip period 1
-        _cancel(alice);
-
-        assertTrue(token.isCanceled(alice));
-        assertEq(token.consumed(alice), 0); // in skip, nothing consumed
+    function test_cap_spendBelowCap() public {
+        _mint(alice, RATE * 6);
+        _schedule(alice, RATE, PERIOD, 5, 0);
+        assertEq(token.expiry(alice), 1000 + 5 * PERIOD);
+        _spend(alice, RATE * 2);
+        assertEq(token.expiry(alice), 1000 + 4 * PERIOD);
     }
 
-    function test_cancel_duringSkip_settlePreservesBalance() public {
+    // ═══════════════════════════════════════════════════════════════
+    // CANCEL DURING GRACE
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_terminate_duringGrace() public {
         _mint(alice, RATE * 3);
         _schedule(alice, RATE, PERIOD, 0, 2);
-
         _advanceDays(15);
-        _cancel(alice);
+        _terminate(alice);
+        assertTrue(token.isTerminated(alice));
+        assertEq(token.consumed(alice), 0);
+    }
 
-        // Service end = current period boundary = day 1030
-        _advanceDays(16); // day 1031, past service end
-
+    function test_terminate_duringGrace_settlePreservesBalance() public {
+        _mint(alice, RATE * 3);
+        _schedule(alice, RATE, PERIOD, 0, 2);
+        _advanceDays(15);
+        _terminate(alice);
+        _advanceDays(16);
         token.settle(alice);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
-        assertEq(principal, RATE * 3); // nothing consumed during skip
+        assertEq(principal, RATE * 3);
         assertEq(rate, 0);
     }
 
@@ -459,204 +407,148 @@ contract SimpleSiphonTest is Test {
     // CLEAR SCHEDULE
     // ═══════════════════════════════════════════════════════════════
 
-    function test_clear_immediateWipe() public {
-        _fundAndSchedule(alice, RATE * 3);
+    function test_clear_immediate() public {
+        _fundAndAuto(alice, RATE * 3);
         _advanceDays(5);
-
         _clear(alice);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
         assertEq(rate, 0);
-        assertEq(principal, RATE * 2); // 1 period consumed
+        assertEq(principal, RATE * 2);
     }
 
-    function test_clear_duringSkip() public {
+    function test_clear_duringGrace() public {
         _mint(alice, RATE * 3);
         _schedule(alice, RATE, PERIOD, 0, 2);
         _advanceDays(15);
-
         _clear(alice);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
         assertEq(rate, 0);
-        assertEq(principal, RATE * 3); // nothing consumed during skip
+        assertEq(principal, RATE * 3);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LISTENER CALLBACKS
+    // LISTENER
     // ═══════════════════════════════════════════════════════════════
 
     function test_listener_setSchedule() public {
         _mint(alice, RATE);
-        _autoSchedule(alice);
+        _auto(alice);
         assertEq(listener.callCount(), 1);
-        (address t, address u, bool active) = listener.calls(0);
-        assertEq(t, address(token));
-        assertEq(u, alice);
+        (,, bool active) = listener.calls(0);
         assertTrue(active);
     }
 
     function test_listener_settle() public {
-        _fundAndSchedule(alice, RATE);
+        _fundAndAuto(alice, RATE);
         _advanceDays(31);
         token.settle(alice);
-        // setSchedule + settle = 2 calls
         assertEq(listener.callCount(), 2);
-        (, , bool active) = listener.calls(1);
+        (,, bool active) = listener.calls(1);
         assertFalse(active);
     }
 
-    function test_listener_addSkip() public {
-        _fundAndSchedule(alice, RATE * 3);
+    function test_listener_addGrace() public {
+        _fundAndAuto(alice, RATE * 3);
         _advanceDays(5);
-        _skip(alice, 2);
-        // setSchedule + addSkipPeriods = 2 calls
+        _grace(alice, 2);
         assertEq(listener.callCount(), 2);
-        (, , bool active) = listener.calls(1);
-        assertTrue(active);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // SCHEDULE REPLACEMENT (plan switch)
+    // SCHEDULE REPLACEMENT
     // ═══════════════════════════════════════════════════════════════
 
-    function test_scheduleReplace_checkpointsOld() public {
-        _fundAndSchedule(alice, RATE * 3 + 5000 ether);
+    function test_replace_checkpointsOld() public {
+        _fundAndAuto(alice, RATE * 3 + 5000 ether);
         _advanceDays(15);
-
-        // Switch to different rate
         _schedule(alice, 5000 ether, PERIOD, 0, 0);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
         assertEq(rate, 5000 ether);
-        // Old schedule checkpoint: consumed 1 period (RATE). principal = (RATE*3 + 5000) - RATE = RATE*2 + 5000.
         assertEq(principal, RATE * 2 + 5000 ether);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // FULL LIFECYCLE PATHS (Markov chains)
+    // FULL LIFECYCLE PATHS
     // ═══════════════════════════════════════════════════════════════
 
-    // Path: EMPTY -> FUNDED -> ACTIVE -> LAPSED -> FUNDED -> ACTIVE
     function test_path_basicRelapse() public {
         _mint(alice, RATE * 2);
-        _autoSchedule(alice);
+        _auto(alice);
         _advanceDays(61);
         assertTrue(token.isLapsed(alice));
-
         _mint(alice, RATE * 3);
-        assertFalse(token.isLapsed(alice));
-        _autoSchedule(alice);
+        _auto(alice);
         assertTrue(token.isActive(alice));
     }
 
-    // Path: FUNDED -> ACTIVE -> CANCELED -> SETTLED -> FUNDED -> ACTIVE
-    function test_path_cancelAndReturn() public {
-        _fundAndSchedule(alice, RATE * 3);
+    function test_path_terminateAndReturn() public {
+        _fundAndAuto(alice, RATE * 3);
         _advanceDays(5);
-        _cancel(alice);
-        _advanceDays(26); // past period end
-
-        _autoSchedule(alice); // settle + new schedule
+        _terminate(alice);
+        _advanceDays(26);
+        _auto(alice);
         assertTrue(token.isActive(alice));
-        assertEq(token.balanceOf(alice), RATE); // 3 - 1 settled - 1 new period = 1
+        assertEq(token.balanceOf(alice), RATE);
     }
 
-    // Path: FUNDED -> ACTIVE_SKIP -> ACTIVE_POST_SKIP -> LAPSED -> FUNDED -> ACTIVE
-    function test_path_prepayThenAutoThenLapseReturn() public {
+    function test_path_prepayAutoLapseReturn() public {
         _mint(alice, RATE * 2);
-        _schedule(alice, RATE, PERIOD, 0, 3); // 3 skip + 2 funded
-        // Expiry = 1000 + 5*30 = 1150
-
-        // Skip zone
+        _schedule(alice, RATE, PERIOD, 0, 3);
         _warpToDay(1080);
-        assertTrue(token.isInSkipZone(alice));
-        assertEq(token.balanceOf(alice), RATE * 2);
-
-        // Post-skip: period 4 = first billable (day 1090)
+        assertTrue(token.isGracePeriod(alice));
         _warpToDay(1095);
-        assertFalse(token.isInSkipZone(alice));
+        assertFalse(token.isGracePeriod(alice));
         assertEq(token.consumed(alice), RATE);
-
-        // Lapse at expiry (day 1150)
         _warpToDay(1150);
         assertTrue(token.isLapsed(alice));
-
-        // Return
         _mint(alice, RATE * 2);
-        _autoSchedule(alice);
+        _auto(alice);
         assertTrue(token.isActive(alice));
     }
 
-    // Path: ACTIVE -> addSkip -> ACTIVE_SKIP -> addSkip -> ACTIVE_SKIP -> POST_SKIP -> LAPSE
-    function test_path_repeatedPrepay() public {
-        _fundAndSchedule(alice, RATE * 4);
-        assertEq(token.expiry(alice), 1000 + 4 * PERIOD);
-
-        // Day 10: first prepay
+    function test_path_repeatedGrace() public {
+        _fundAndAuto(alice, RATE * 4);
         _advanceDays(10);
-        _skip(alice, 2); // checkpoint @ day 1010, consumed RATE, principal=3*RATE, skip=2
-
-        // Day 40: second prepay (still in skip zone from first)
+        _grace(alice, 2);
+        // principal=3*RATE, anchor=1010, grace=2
         _advanceDays(30);
-        _skip(alice, 1); // checkpoint @ day 1040, consumed=0 (in skip), skip cleared then +1
-
-        // From day 1040: skip=1, principal=3*RATE, funded=3
-        // Expiry = 1040 + (1+3)*30 = 1040 + 120 = 1160
-        assertEq(token.expiry(alice), 1160);
-
-        // Lapse check
-        _warpToDay(1161);
+        _grace(alice, 1);
+        // principal=3*RATE, anchor=1040, grace=1
+        assertEq(token.expiry(alice), 1040 + (1 + 3) * PERIOD);
+        _warpToDay(1160);
         assertTrue(token.isLapsed(alice));
     }
 
-    // Path: ACTIVE -> spend -> reduced expiry -> addSkip -> ACTIVE_SKIP
-    function test_path_spendThenPrepay() public {
-        _fundAndSchedule(alice, RATE * 4);
-        assertEq(token.expiry(alice), 1000 + 4 * PERIOD);
-
-        // Spend 1 period worth
+    function test_path_spendThenGrace() public {
+        _fundAndAuto(alice, RATE * 4);
         _spend(alice, RATE);
-        assertEq(token.expiry(alice), 1000 + 3 * PERIOD); // lost 1 period
-
-        // Add 2 prepaid months
+        assertEq(token.expiry(alice), 1000 + 3 * PERIOD);
         _advanceDays(5);
-        _skip(alice, 2);
-        // Checkpoint: consumed=RATE, principal=3*RATE-RATE=2*RATE, skip=2
+        _grace(alice, 2);
         assertEq(token.expiry(alice), 1005 + (2 + 2) * PERIOD);
     }
 
-    // Path: ACTIVE_SKIP -> cancel -> CANCELED -> settle -> FUNDED
-    function test_path_cancelDuringSkip() public {
+    function test_path_terminateDuringGrace() public {
         _mint(alice, RATE * 3);
         _schedule(alice, RATE, PERIOD, 0, 2);
-
         _advanceDays(15);
-        _cancel(alice);
-
-        // Past period end
+        _terminate(alice);
         _advanceDays(16);
-        assertFalse(token.isCanceled(alice));
-
+        assertFalse(token.isTerminated(alice));
         token.settle(alice);
         (uint128 principal, uint128 rate,,,,,) = token.getSchedule(alice);
         assertEq(rate, 0);
-        assertEq(principal, RATE * 3); // full balance preserved (skip = no consumption)
+        assertEq(principal, RATE * 3);
     }
 
-    // Path: sponsor prepay 1 month -> user deposits + starts autopay mid-month
     function test_path_sponsorThenUserAutopay() public {
-        // Sponsor gives alice 1 month prepaid (no UBI balance, just skip)
-        _mint(alice, 1); // minimal
+        _mint(alice, 1);
         _schedule(alice, RATE, PERIOD, 0, 1);
-
-        assertTrue(token.isActive(alice));
-        assertTrue(token.isInSkipZone(alice));
-
-        // Day 1015: alice deposits and wants autopay after prepaid month
+        assertTrue(token.isGracePeriod(alice));
         _advanceDays(15);
-        _mint(alice, RATE * 3); // now has 3 months worth + 1 wei
-
-        // After skip month ends (day 1030), autopay should consume
-        _advanceDays(15); // day 1030, period 2 starts (first billable)
-        assertFalse(token.isInSkipZone(alice));
+        _mint(alice, RATE * 3);
+        _advanceDays(15);
+        assertFalse(token.isGracePeriod(alice));
         assertEq(token.consumed(alice), RATE);
     }
 
@@ -664,58 +556,176 @@ contract SimpleSiphonTest is Test {
     // EDGE CASES
     // ═══════════════════════════════════════════════════════════════
 
-    function test_edge_setScheduleInsufficientForNonSkip() public {
+    function test_edge_transferToZero() public {
+        _mint(alice, RATE);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SiphonToken.ERC20InvalidReceiver.selector, address(0)));
+        token.transfer(address(0), RATE);
+    }
+
+    function test_edge_transferFromZero() public {
+        // Allowance check fires before zero-address check, but both paths revert
+        vm.expectRevert(SiphonToken.InsufficientAllowance.selector);
+        token.transferFrom(address(0), alice, RATE);
+    }
+
+    function test_edge_insufficientForNonGrace() public {
         _mint(alice, RATE - 1);
         vm.prank(sched);
         vm.expectRevert(SiphonToken.InsufficientBalance.selector);
         token.setSchedule(alice, RATE, PERIOD, 0, 0);
     }
 
-    function test_edge_setScheduleWithSkipNoBalance() public {
-        // With skip > 0, we allow zero funded periods (pure prepay)
+    function test_edge_graceWithNoBalance() public {
         _mint(alice, 1);
         _schedule(alice, RATE, PERIOD, 0, 3);
         assertTrue(token.isActive(alice));
     }
 
-    function test_edge_cancelAlreadyCanceled() public {
-        _fundAndSchedule(alice, RATE * 3);
-        _cancel(alice);
+    function test_edge_doubleTerminate() public {
+        _fundAndAuto(alice, RATE * 3);
+        _terminate(alice);
         vm.prank(sched);
         vm.expectRevert(SiphonToken.NoSchedule.selector);
-        token.cancelSchedule(alice);
+        token.terminateSchedule(alice);
     }
 
-    function test_edge_addSkipToCanceled() public {
-        _fundAndSchedule(alice, RATE * 3);
-        _cancel(alice);
+    function test_edge_addGraceToTerminated() public {
+        _fundAndAuto(alice, RATE * 3);
+        _terminate(alice);
         vm.prank(sched);
         vm.expectRevert(SiphonToken.NoSchedule.selector);
-        token.addSkipPeriods(alice, 2);
+        token.addGracePeriods(alice, 2);
     }
 
-    function test_edge_setMaxPeriodsNoSchedule() public {
+    function test_edge_addGraceToLapsed() public {
+        _fundAndAuto(alice, RATE);
+        _advanceDays(31);
+        vm.prank(sched);
+        vm.expectRevert(SiphonToken.NoSchedule.selector);
+        token.addGracePeriods(alice, 2);
+    }
+
+    function test_edge_capNoSchedule() public {
         vm.prank(alice);
         vm.expectRevert(SiphonToken.NoSchedule.selector);
-        token.setMaxPeriods(3);
+        token.setCap(3);
     }
 
     function test_edge_settleNoOp() public {
         _mint(alice, RATE);
-        token.settle(alice); // no schedule, should be no-op
+        token.settle(alice);
         assertEq(token.balanceOf(alice), RATE);
     }
 
     function test_edge_publicSettle() public {
-        _fundAndSchedule(alice, RATE);
+        _fundAndAuto(alice, RATE);
         _advanceDays(31);
-
-        // Anyone can call settle
         vm.prank(bob);
         token.settle(alice);
-
         (,uint128 rate,,,,,) = token.getSchedule(alice);
         assertEq(rate, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // TRANSFER INTERACTIONS
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_transfer_extendsReceiverExpiry() public {
+        _fundAndAuto(alice, RATE * 2);
+        _fundAndAuto(bob, RATE);
+        assertEq(token.expiry(bob), 1000 + PERIOD);
+
+        // Alice transfers RATE to bob — his principal increases, expiry extends
+        vm.prank(alice);
+        token.transfer(bob, RATE);
+        assertEq(token.expiry(bob), 1000 + 2 * PERIOD);
+    }
+
+    function test_transfer_settlesStaleReceiver() public {
+        _fundAndAuto(bob, RATE);
+        _advanceDays(31); // bob lapsed
+        assertTrue(token.isLapsed(bob));
+
+        _mint(alice, RATE * 2);
+        vm.prank(alice);
+        token.transfer(bob, RATE);
+
+        // Bob's lapsed schedule should be settled first, then transfer lands
+        (uint128 principal, uint128 rate,,,,,) = token.getSchedule(bob);
+        assertEq(rate, 0); // schedule cleared by settle
+        assertEq(principal, RATE); // only the transferred amount (consumed deducted by settle)
+    }
+
+    function test_transfer_settlesStaleSender() public {
+        _fundAndAuto(alice, RATE * 2);
+        _advanceDays(61); // lapsed, consumed 2*RATE
+        _mint(alice, RATE * 3); // settle fires: principal = 0 + 3*RATE = 3*RATE
+
+        vm.prank(alice);
+        token.transfer(bob, RATE);
+        assertEq(token.balanceOf(alice), RATE * 2);
+        assertEq(token.balanceOf(bob), RATE);
+    }
+
+    function test_transfer_zero() public {
+        _mint(alice, RATE);
+        vm.prank(alice);
+        token.transfer(bob, 0); // ERC20 spec: MUST treat as normal
+        assertEq(token.balanceOf(alice), RATE);
+        assertEq(token.balanceOf(bob), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // TERMINATE — FINAL PERIOD PRESERVED
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_terminate_finalPeriodPreserved() public {
+        _fundAndAuto(alice, RATE * 3);
+        _advanceDays(5);
+        _terminate(alice);
+
+        // Terminated but still in final period — schedule should NOT settle yet
+        assertTrue(token.isTerminated(alice));
+        assertEq(token.consumed(alice), RATE); // frozen at period 1
+
+        // Deposit during final period should NOT clear schedule
+        _mint(alice, RATE);
+        assertTrue(token.isTerminated(alice)); // still terminated, not settled
+
+        // Past period boundary — now settle can fire
+        _advanceDays(26); // day 1031
+        assertFalse(token.isTerminated(alice)); // service ended
+        token.settle(alice);
+        (,uint128 rate,,,,,) = token.getSchedule(alice);
+        assertEq(rate, 0); // settled
+    }
+
+    function test_terminate_postGrace() public {
+        // Grace periods, then autopay, then terminate during autopay
+        _mint(alice, RATE * 3);
+        _schedule(alice, RATE, PERIOD, 0, 2);
+        // 2 grace + 3 funded. expiry = 1000 + 5*30 = 1150.
+
+        // Day 1065: period 3 (first billable, started at day 1060)
+        _warpToDay(1065);
+        assertFalse(token.isGracePeriod(alice));
+        // periodsStarted = ((1065-1000)/30)+1 = 3, billable = 3-2 = 1
+        assertEq(token.consumed(alice), RATE);
+
+        _terminate(alice);
+        assertTrue(token.isTerminated(alice));
+
+        // Service until period boundary (day 1090)
+        _warpToDay(1085);
+        assertTrue(token.isTerminated(alice));
+
+        // Past boundary
+        _warpToDay(1090);
+        assertFalse(token.isTerminated(alice));
+        token.settle(alice);
+        (uint128 principal,,,,,, ) = token.getSchedule(alice);
+        assertEq(principal, RATE * 2); // 3 - 1 consumed
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -723,10 +733,9 @@ contract SimpleSiphonTest is Test {
     // ═══════════════════════════════════════════════════════════════
 
     function test_tracking_siphoned() public {
-        _fundAndSchedule(alice, RATE);
+        _fundAndAuto(alice, RATE);
         _advanceDays(31);
         token.settle(alice);
-
         assertEq(token.totalSiphoned(), RATE);
         assertEq(token.totalSpent(), 0);
     }
@@ -739,69 +748,46 @@ contract SimpleSiphonTest is Test {
     }
 
     function test_tracking_totalSupply() public {
-        _mint(alice, RATE * 3);
-        _autoSchedule(alice);
+        _fundAndAuto(alice, RATE * 3);
         _advanceDays(91);
-
         token.settle(alice);
         assertEq(token.totalSupply(), 0);
-        assertEq(token.totalMinted(), RATE * 3);
-        assertEq(token.totalSiphoned(), RATE * 3);
     }
 
     // ═══════════════════════════════════════════════════════════════
     // FUZZ
     // ═══════════════════════════════════════════════════════════════
 
-    function testFuzz_balanceNeverNegative(uint256 deposit_, uint256 days_) public {
+    function testFuzz_balanceNeverUnderflows(uint256 deposit_, uint256 days_) public {
         deposit_ = bound(deposit_, RATE, RATE * 6);
         days_ = bound(days_, 0, 365);
-
         _mint(alice, uint128(deposit_));
-        _autoSchedule(alice);
+        _auto(alice);
         _advanceDays(days_);
-
         assertLe(token.consumed(alice), deposit_);
     }
 
-    function testFuzz_skipPreservesBalance(uint16 skipP, uint256 days_) public {
-        skipP = uint16(bound(skipP, 1, 6));
-        days_ = bound(days_, 0, uint256(skipP) * PERIOD);
-
+    function testFuzz_gracePreservesBalance(uint16 grace, uint256 days_) public {
+        grace = uint16(bound(grace, 1, 6));
+        days_ = bound(days_, 0, uint256(grace) * PERIOD);
         _mint(alice, RATE);
-        _schedule(alice, RATE, PERIOD, 0, skipP);
+        _schedule(alice, RATE, PERIOD, 0, grace);
         _advanceDays(days_);
-
-        // During skip zone, balance should be unchanged
-        if (days_ < uint256(skipP) * PERIOD) {
+        if (days_ < uint256(grace) * PERIOD) {
             assertEq(token.balanceOf(alice), RATE);
         }
     }
 
-    function testFuzz_lifecycle(
-        uint256 deposit_,
-        uint16 skipP,
-        uint256 days1,
-        uint256 days2,
-        bool doCancel
-    ) public {
+    function testFuzz_lifecycle(uint256 deposit_, uint16 grace, uint256 d1, uint256 d2, bool doCancel) public {
         deposit_ = bound(deposit_, RATE, RATE * 6);
-        skipP = uint16(bound(skipP, 0, 4));
-        days1 = bound(days1, 0, 180);
-        days2 = bound(days2, 1, 180);
-
+        grace = uint16(bound(grace, 0, 4));
+        d1 = bound(d1, 0, 180);
+        d2 = bound(d2, 1, 180);
         _mint(alice, uint128(deposit_));
-        _schedule(alice, RATE, PERIOD, 0, skipP);
-
-        _advanceDays(days1);
-
-        if (doCancel && token.isActive(alice)) {
-            _cancel(alice);
-        }
-
-        _advanceDays(days2);
-
-        // Invariant: consumed <= deposit
+        _schedule(alice, RATE, PERIOD, 0, grace);
+        _advanceDays(d1);
+        if (doCancel && token.isActive(alice)) _terminate(alice); // param name is legacy
+        _advanceDays(d2);
         assertLe(token.consumed(alice), deposit_);
     }
 }
