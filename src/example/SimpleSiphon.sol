@@ -5,9 +5,8 @@ import {SiphonToken} from "../SiphonToken.sol";
 
 /**
  * @title SimpleSiphon — Example SiphonToken implementation
- * @notice Demonstrates both burn-path and beneficiary schedules.
- *         Scheduler manages assignments, spender makes one-time deductions.
- *         Transfers are enabled (standard ERC20).
+ * @notice Multi-schedule token with scheduler-managed assignments and burn schedules.
+ *         TERM_DAYS=30, MAX_SUBS=16. Transfers enabled (standard ERC20).
  */
 contract SimpleSiphon is SiphonToken {
     address public owner;
@@ -18,7 +17,7 @@ contract SimpleSiphon is SiphonToken {
     modifier onlyScheduler() { if (msg.sender != scheduler) revert Unauthorized(); _; }
     modifier onlySpender() { if (msg.sender != spender) revert Unauthorized(); _; }
 
-    constructor(address _owner) SiphonToken(0) {
+    constructor(address _owner) SiphonToken(0, 30, 16) {
         owner = _owner;
     }
 
@@ -32,23 +31,25 @@ contract SimpleSiphon is SiphonToken {
 
     function mint(address _user, uint128 _amount) external onlyOwner { _mint(_user, _amount); }
 
-    /// @notice Scheduler assigns a beneficiary schedule (beneficiary = _to).
-    function assignSchedule(
-        address _user, address _to, uint128 _rate, uint16 _interval
-    ) external onlyScheduler {
-        _assign(_user, _to, _rate, _interval);
+    /// @notice Scheduler assigns a beneficiary schedule to a user.
+    function assignSchedule(address _user, address _beneficiary, uint128 _rate) external onlyScheduler {
+        _assign(_user, _beneficiary, _rate);
     }
 
-    /// @notice Scheduler sets a burn-path schedule.
-    function setSchedule(
-        address _user, uint128 _rate, uint16 _interval
-    ) external onlyScheduler {
-        _setSchedule(_user, _rate, _interval);
+    /// @notice Scheduler assigns a burn schedule to a user.
+    function assignBurn(address _user, uint128 _rate) external onlyScheduler {
+        _assign(_user, address(0), _rate);
     }
 
-    function comp(address _user, uint8 _periods) external onlyScheduler { _comp(_user, _periods); }
-    function terminateSchedule(address _user) external onlyScheduler { _terminateSchedule(_user); }
-    function clearSchedule(address _user) external onlyScheduler { _clearSchedule(_user); }
+    /// @notice Scheduler terminates a specific schedule for a user.
+    function terminateSub(address _user, bytes32 _sid) external onlyScheduler {
+        _terminate(_user, _sid);
+    }
+
+    /// @notice Scheduler clears a specific schedule immediately.
+    function clearSub(address _user, bytes32 _sid) external onlyScheduler {
+        _clear(_user, _sid);
+    }
 
     function spend(address _user, uint128 _amount) external onlySpender { _spend(_user, _amount); }
 }
