@@ -14,8 +14,6 @@ contract SimpleSiphon is SiphonToken {
     address public scheduler;
     address public spender;
 
-    error Unauthorized();
-
     modifier onlyOwner() { if (msg.sender != owner) revert Unauthorized(); _; }
     modifier onlyScheduler() { if (msg.sender != scheduler) revert Unauthorized(); _; }
     modifier onlySpender() { if (msg.sender != spender) revert Unauthorized(); _; }
