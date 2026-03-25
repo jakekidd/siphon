@@ -151,9 +151,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     /// @dev Per-user hint: which epoch their dropoff is placed at.
     mapping(address => uint32) internal _userDropoffEpoch;
 
-    /// @dev Optional human-readable name per scheduleId. Set by anyone (typically the creator).
-    mapping(bytes32 => string) public scheduleName;
-
     /// @notice Optional callback for schedule state changes.
     address public scheduleListener;
 
@@ -216,11 +213,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     /// @notice Check remaining schedule approvals.
     function scheduleAllowance(address _user, bytes32 _sid) external view returns (uint256) {
         return _scheduleApprovals[_user][_sid];
-    }
-
-    /// @notice Set a human-readable name for a schedule. Anyone can call.
-    function nameSchedule(bytes32 _sid, string calldata _name) external {
-        scheduleName[_sid] = _name;
     }
 
     // ──────────────────────────────────────────────
