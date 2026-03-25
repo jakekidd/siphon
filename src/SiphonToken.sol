@@ -10,40 +10,40 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  * @author Ubitel
  *
  * @notice ERC20 where balanceOf decays over time via multiple concurrent
- *         payment schedules. Like a bank account with multiple autopays.
+ *         payment mandates. Like a bank account with multiple autopays.
  *
  * @dev Key concepts:
  *
- *   MULTI-SCHEDULE
- *     Users can have up to MAX_SUBS active schedules, each paying a different
- *     beneficiary. All schedules share one principal and use the same billing
- *     interval (TERM_DAYS). balanceOf is O(1) via totalRate.
+ *   MULTI-MANDATE
+ *     Users can have up to MAX_TAPS active mandates, each paying a different
+ *     beneficiary. All mandates share one principal and use the same billing
+ *     interval (TERM_DAYS). balanceOf is O(1) via outflow.
  *
  *   BENEFICIARY = SCHEDULER
- *     The beneficiary IS the entity that assigns schedules. msg.sender on
- *     assign() is the beneficiary. Users pre-approve via approveSchedule().
- *     scheduleId = keccak256(beneficiary, rate).
+ *     The beneficiary IS the entity that taps users. msg.sender on tap() is
+ *     the beneficiary. Users pre-authorize via authorize().
+ *     mandateId = keccak256(beneficiary, rate).
  *
  *   BURN PATH
- *     Burn schedules have beneficiary=address(0). Same array, same totalRate.
- *     No approval needed (self-assigned). No bucket ops (no collect for burns).
+ *     Burn mandates have beneficiary=address(0). Same array, same outflow.
+ *     No authorization needed (self-assigned). No bucket ops (no harvest).
  *
  *   SPONSORSHIP
- *     Anyone can sponsor tokens for a user's specific schedule. Sponsored
- *     tokens are locked (non-transferable) and consumed BEFORE principal.
- *     A sponsored schedule can survive past shared lapse.
+ *     Anyone can sponsor tokens for a user's specific mandate. Sponsored
+ *     tokens are locked and consumed BEFORE principal. A sponsored mandate
+ *     can survive past shared lapse.
  *
  *   PRIORITY
- *     When funds run out, schedules are resolved in subscription order
- *     (first-assigned = first-paid). Lower-priority schedules lapse first.
+ *     When funds run out, mandates are resolved in tap order (first-tapped
+ *     = first-paid). Lower-priority mandates lapse first.
  *
  *   LAZY SETTLEMENT
- *     balanceOf = principal - min(elapsed, principal/totalRate) * totalRate.
- *     O(1). Storage only changes via checkpoint on interaction.
+ *     balanceOf = principal - min(elapsed, principal/outflow) * outflow.
+ *     O(1). Storage only changes via _settle on interaction.
  *
- *   SCHEDULE STRUCT — 1 SLOT PER SUBSCRIPTION
- *     UserState: { uint128 principal, uint128 totalRate }  [1 slot shared]
- *     Subscription: { uint128 rate, uint32 joinedAtEpoch, uint32 terminatedAt }
+ *   STRUCTS
+ *     Account: { uint128 principal, uint128 outflow }  [1 slot shared per user]
+ *     Tap: { uint128 rate, uint32 entryEpoch, uint32 revokedAt }  [1 slot per mandate]
  */
 abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
@@ -53,58 +53,50 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     error InsufficientBalance();
     /// @notice ERC20 standard (OpenZeppelin ERC20Errors.sol).
     error InsufficientAllowance();
-    error NoSchedule();
     /// @notice ERC20 standard (OpenZeppelin ERC20Errors.sol).
     error ERC20InvalidReceiver(address receiver);
     /// @notice ERC20 standard (OpenZeppelin ERC20Errors.sol).
     error ERC20InvalidSender(address sender);
     error InvalidBeneficiary();
-    error InvalidSchedule();
+    error InvalidMandate();
     error NotApproved();
     error Unauthorized();
-    error MaxSubscriptions();
-    error ScheduleNotFound();
+    error MaxTaps();
+    error TapNotFound();
+    error NotActive();
 
     // ──────────────────────────────────────────────
     // Events
     // ──────────────────────────────────────────────
 
-    event ScheduleSet(address indexed user, bytes32 indexed scheduleId, address beneficiary, uint128 rate);
-    event ScheduleTerminated(address indexed user, bytes32 indexed scheduleId, uint32 terminatedAt);
-    event ScheduleCleared(address indexed user, bytes32 indexed scheduleId);
-    event ScheduleSettled(address indexed user, uint256 amount);
-    event ScheduleApproval(address indexed user, bytes32 indexed scheduleId, uint256 count);
-    event ScheduleListed(bytes32 indexed scheduleId, address indexed beneficiary, uint128 rate);
-    event Sponsored(address indexed user, bytes32 indexed scheduleId, uint256 amount);
+    event Tapped(address indexed user, bytes32 indexed mandateId, address beneficiary, uint128 rate);
+    event Revoked(address indexed user, bytes32 indexed mandateId, uint32 revokedAt);
+    event Settled(address indexed user, uint256 amount);
+    event Authorized(address indexed user, bytes32 indexed mandateId, uint256 count);
+    event Sponsored(address indexed user, bytes32 indexed mandateId, uint256 amount);
     event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
-    event Collected(address indexed beneficiary, bytes32 indexed scheduleId, uint256 amount, uint256 epochs);
-    event ScheduleListenerSet(address listener);
+    event Harvested(address indexed beneficiary, bytes32 indexed mandateId, uint256 amount, uint256 epochs);
+    event ListenerSet(address listener);
 
     // ──────────────────────────────────────────────
     // Structs
     // ──────────────────────────────────────────────
 
     /// @dev Shared per user. 1 storage slot.
-    struct UserState {
+    struct Account {
         uint128 principal;
-        uint128 totalRate;
+        uint128 outflow;
     }
 
-    /// @dev Per user per scheduleId. 1 storage slot.
-    struct Subscription {
+    /// @dev Per user per mandateId. 1 storage slot.
+    struct Tap {
         uint128 rate;
-        uint32 joinedAtEpoch;
-        uint32 terminatedAt;
+        uint32 entryEpoch;
+        uint32 revokedAt;
     }
 
-    /// @dev Shared schedule definition. Created lazily on first assign.
-    struct ScheduleConfig {
-        address beneficiary;
-        uint128 rate;
-    }
-
-    /// @dev Collection checkpoint per scheduleId. 1 storage slot.
+    /// @dev Collection checkpoint per mandateId. 1 storage slot.
     struct Checkpoint {
         uint32 lastEpoch;
         uint224 count;
@@ -122,29 +114,28 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
     uint32 public immutable DEPLOY_DAY;
     uint16 public immutable TERM_DAYS;
-    uint8 public immutable MAX_SUBS;
+    uint8 public immutable MAX_TAPS;
 
     // ──────────────────────────────────────────────
     // State
     // ──────────────────────────────────────────────
 
-    mapping(address => UserState) internal _users;
-    mapping(address => uint32) internal _userAnchor;
+    mapping(address => Account) internal _accounts;
+    mapping(address => uint32) internal _anchor;
     mapping(address => mapping(address => uint256)) internal _allowances;
 
     uint256 public totalMinted;
     uint256 public totalBurned;
     uint256 public totalSpent;
 
-    mapping(bytes32 => ScheduleConfig) internal _configs;
-    mapping(address => mapping(bytes32 => uint256)) internal _scheduleApprovals;
+    mapping(address => mapping(bytes32 => uint256)) internal _authorizations;
     mapping(bytes32 => Checkpoint) internal _checkpoints;
-    mapping(bytes32 => mapping(uint256 => uint256)) internal _joinoffs;
-    mapping(bytes32 => mapping(uint256 => uint256)) internal _dropoffs;
+    mapping(bytes32 => mapping(uint256 => uint256)) internal _entries;
+    mapping(bytes32 => mapping(uint256 => uint256)) internal _exits;
 
-    mapping(address => bytes32[]) internal _userSubs;
-    mapping(address => mapping(bytes32 => Subscription)) internal _subs;
-    mapping(address => mapping(bytes32 => uint32)) internal _subDropoffEpoch;
+    mapping(address => bytes32[]) internal _userTaps;
+    mapping(address => mapping(bytes32 => Tap)) internal _taps;
+    mapping(address => mapping(bytes32 => uint32)) internal _mandateExitEpoch;
     mapping(address => mapping(bytes32 => uint256)) internal _sponsored;
 
     address public scheduleListener;
@@ -153,12 +144,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Constructor
     // ──────────────────────────────────────────────
 
-    constructor(uint32 _deployDay, uint16 _termDays, uint8 _maxSubs) {
+    constructor(uint32 _deployDay, uint16 _termDays, uint8 _maxTaps) {
         DEPLOY_DAY = _deployDay == 0 ? uint32(block.timestamp / _SECONDS_PER_DAY) : _deployDay;
         require(_termDays > 0, "term must be > 0");
-        require(_maxSubs > 0, "max subs must be > 0");
+        require(_maxTaps > 0, "max taps must be > 0");
         TERM_DAYS = _termDays;
-        MAX_SUBS = _maxSubs;
+        MAX_TAPS = _maxTaps;
     }
 
     // ──────────────────────────────────────────────
@@ -199,34 +190,36 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     // ──────────────────────────────────────────────
-    // Schedule Approval
+    // Authorization (mandate approval)
     // ──────────────────────────────────────────────
 
-    function approveSchedule(bytes32 _sid, uint256 _count) external {
-        _scheduleApprovals[msg.sender][_sid] = _count;
-        emit ScheduleApproval(msg.sender, _sid, _count);
+    /// @notice Pre-authorize a mandate. Each tap() consumes one.
+    ///         type(uint256).max = infinite (beneficiary can re-tap freely).
+    function authorize(bytes32 _mid, uint256 _count) external {
+        _authorizations[msg.sender][_mid] = _count;
+        emit Authorized(msg.sender, _mid, _count);
     }
 
-    function scheduleAllowance(address _user, bytes32 _sid) external view returns (uint256) {
-        return _scheduleApprovals[_user][_sid];
+    function authorization(address _user, bytes32 _mid) external view returns (uint256) {
+        return _authorizations[_user][_mid];
     }
 
     // ──────────────────────────────────────────────
     // Views
     // ──────────────────────────────────────────────
 
-    function getUser(address _user) external view returns (uint128 principal, uint128 totalRate, uint32 anchor) {
-        UserState storage u = _users[_user];
-        return (u.principal, u.totalRate, _userAnchor[_user]);
+    function getAccount(address _user) external view returns (uint128 principal, uint128 outflow, uint32 anchor) {
+        Account storage a = _accounts[_user];
+        return (a.principal, a.outflow, _anchor[_user]);
     }
 
-    function getSub(address _user, bytes32 _sid) external view returns (uint128 rate, uint32 joinedAtEpoch, uint32 terminatedAt, uint256 sponsored) {
-        Subscription storage sub = _subs[_user][_sid];
-        return (sub.rate, sub.joinedAtEpoch, sub.terminatedAt, _sponsored[_user][_sid]);
+    function getTap(address _user, bytes32 _mid) external view returns (uint128 rate, uint32 entryEpoch, uint32 revokedAt, uint256 sponsored) {
+        Tap storage t = _taps[_user][_mid];
+        return (t.rate, t.entryEpoch, t.revokedAt, _sponsored[_user][_mid]);
     }
 
-    function getUserSubs(address _user) external view returns (bytes32[] memory) {
-        return _userSubs[_user];
+    function getUserTaps(address _user) external view returns (bytes32[] memory) {
+        return _userTaps[_user];
     }
 
     function consumed(address _user) external view returns (uint256) {
@@ -234,20 +227,20 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     function isActive(address _user) external view returns (bool) {
-        UserState storage u = _users[_user];
-        if (u.totalRate == 0) return false;
-        return _funded(u) > 0 || _hasAnySponsoredActive(_user);
+        Account storage a = _accounts[_user];
+        if (a.outflow == 0) return false;
+        return _funded(a) > 0 || _hasAnySponsoredActive(_user);
     }
 
-    function isSubActive(address _user, bytes32 _sid) external view returns (bool) {
-        Subscription storage sub = _subs[_user][_sid];
-        if (sub.rate == 0) return false;
-        if (sub.terminatedAt > 0) return false;
-        UserState storage u = _users[_user];
+    function isTapActive(address _user, bytes32 _mid) external view returns (bool) {
+        Tap storage t = _taps[_user][_mid];
+        if (t.rate == 0) return false;
+        if (t.revokedAt > 0) return false;
+        Account storage a = _accounts[_user];
         uint256 elapsed = _periodsElapsed(_user);
-        uint256 funded = _funded(u);
+        uint256 funded = _funded(a);
         if (elapsed <= funded) return true;
-        return _sponsored[_user][_sid] >= sub.rate;
+        return _sponsored[_user][_mid] >= t.rate;
     }
 
     function currentDay() external view returns (uint256) {
@@ -258,17 +251,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return _epochOf();
     }
 
-    function scheduleId(address _beneficiary, uint128 _rate) external pure returns (bytes32) {
-        return _scheduleId(_beneficiary, _rate);
+    function mandateId(address _beneficiary, uint128 _rate) external pure returns (bytes32) {
+        return _mandateId(_beneficiary, _rate);
     }
 
-    function getConfig(bytes32 _sid) external view returns (address beneficiary, uint128 rate) {
-        ScheduleConfig storage c = _configs[_sid];
-        return (c.beneficiary, c.rate);
-    }
-
-    function getCheckpoint(bytes32 _sid) external view returns (uint32 lastEpoch, uint224 count) {
-        Checkpoint storage cp = _checkpoints[_sid];
+    function getCheckpoint(bytes32 _mid) external view returns (uint32 lastEpoch, uint224 count) {
+        Checkpoint storage cp = _checkpoints[_mid];
         return (cp.lastEpoch, cp.count);
     }
 
@@ -277,48 +265,51 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     function settle(address _user) external {
-        _checkpoint(_user);
+        _settle(_user);
     }
 
     // ──────────────────────────────────────────────
-    // Public: Terminate
+    // Public: Revoke (terminate a mandate)
     // ──────────────────────────────────────────────
 
-    /// @notice Terminate a specific schedule. Callable by user or the schedule's beneficiary.
-    function terminate(address _user, bytes32 _sid) external virtual {
-        Subscription storage sub = _subs[_user][_sid];
-        if (sub.rate == 0) revert ScheduleNotFound();
-        ScheduleConfig storage cfg = _configs[_sid];
-        if (msg.sender != _user && msg.sender != cfg.beneficiary) revert Unauthorized();
-        _checkpoint(_user);
-        _terminate(_user, _sid);
-    }
-
-    // ──────────────────────────────────────────────
-    // Public: Assign
-    // ──────────────────────────────────────────────
-
-    /// @notice Assign a schedule to a user. msg.sender IS the beneficiary.
-    ///         Consumes one schedule approval. Immediate first-term payment.
-    function assign(address _user, uint128 _rate) external virtual {
-        bytes32 sid = _scheduleId(msg.sender, _rate);
-        uint256 approvals = _scheduleApprovals[_user][sid];
-        if (approvals == 0) revert NotApproved();
-        if (approvals != type(uint256).max) {
-            _scheduleApprovals[_user][sid] = approvals - 1;
+    /// @notice Revoke a mandate. Callable by the user or the mandate's beneficiary.
+    ///         Service continues through the current paid period, then clears on settle.
+    function revoke(address _user, bytes32 _mid) external virtual {
+        Tap storage t = _taps[_user][_mid];
+        if (t.rate == 0) revert TapNotFound();
+        // Verify caller is user or beneficiary (beneficiary recoverable from hash)
+        if (msg.sender != _user) {
+            if (_mandateId(msg.sender, t.rate) != _mid) revert Unauthorized();
         }
-        _assign(_user, msg.sender, _rate);
+        _settle(_user);
+        _revoke(_user, _mid);
     }
 
     // ──────────────────────────────────────────────
-    // Public: Collect
+    // Public: Tap (beneficiary activates mandate for user)
     // ──────────────────────────────────────────────
 
-    function collect(bytes32 _sid, uint256 _maxEpochs) external {
-        ScheduleConfig storage cfg = _configs[_sid];
-        if (cfg.beneficiary == address(0)) revert InvalidSchedule();
+    /// @notice Tap a user. msg.sender IS the beneficiary.
+    ///         Consumes one authorization. Immediate first-term payment.
+    function tap(address _user, uint128 _rate) external virtual {
+        bytes32 mid = _mandateId(msg.sender, _rate);
+        uint256 auth = _authorizations[_user][mid];
+        if (auth == 0) revert NotApproved();
+        if (auth != type(uint256).max) {
+            _authorizations[_user][mid] = auth - 1;
+        }
+        _tap(_user, msg.sender, _rate);
+    }
 
-        Checkpoint storage cp = _checkpoints[_sid];
+    // ──────────────────────────────────────────────
+    // Public: Harvest (beneficiary collects income)
+    // ──────────────────────────────────────────────
+
+    /// @notice Harvest income for a mandate. Caller passes beneficiary + rate;
+    ///         contract verifies the mandateId hash. Tokens go to beneficiary.
+    function harvest(address _beneficiary, uint128 _rate, uint256 _maxEpochs) external {
+        bytes32 mid = _mandateId(_beneficiary, _rate);
+        Checkpoint storage cp = _checkpoints[mid];
         uint256 current = _epochOf();
         uint256 last = uint256(cp.lastEpoch);
         uint256 end = last + _maxEpochs;
@@ -329,22 +320,22 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint256 total;
 
         for (uint256 e = last + 1; e <= end; e++) {
-            running += _joinoffs[_sid][e];
-            uint256 drops = _dropoffs[_sid][e];
-            if (drops > running) drops = running;
-            running -= drops;
-            delete _joinoffs[_sid][e];
-            delete _dropoffs[_sid][e];
-            total += running * uint256(cfg.rate);
+            running += _entries[mid][e];
+            uint256 ex = _exits[mid][e];
+            if (ex > running) ex = running;
+            running -= ex;
+            delete _entries[mid][e];
+            delete _exits[mid][e];
+            total += running * uint256(_rate);
         }
 
         cp.lastEpoch = uint32(end);
         cp.count = uint224(running);
 
         if (total > 0) {
-            _users[cfg.beneficiary].principal += uint128(total);
-            emit Transfer(address(this), cfg.beneficiary, total);
-            emit Collected(cfg.beneficiary, _sid, total, end - last);
+            _accounts[_beneficiary].principal += uint128(total);
+            emit Transfer(address(this), _beneficiary, total);
+            emit Harvested(_beneficiary, mid, total, end - last);
         }
     }
 
@@ -352,20 +343,19 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Sponsor
     // ──────────────────────────────────────────────
 
-    /// @notice Sponsor tokens for a user's specific schedule. Tokens are locked
-    ///         (non-transferable) and consumed before principal for that schedule.
-    function sponsor(address _user, bytes32 _sid, uint128 _amount) external {
-        Subscription storage sub = _subs[_user][_sid];
-        if (sub.rate == 0) revert ScheduleNotFound();
+    /// @notice Sponsor tokens for a user's specific mandate. Tokens are locked
+    ///         and consumed before principal for that mandate.
+    function sponsor(address _user, bytes32 _mid, uint128 _amount) external {
+        Tap storage t = _taps[_user][_mid];
+        if (t.rate == 0) revert TapNotFound();
 
-        // Transfer tokens from sponsor to contract
-        _transferFrom(msg.sender, address(this), _amount);
-        _sponsored[_user][_sid] += _amount;
+        _debit(msg.sender, _amount);
+        totalSpent += _amount;
+        _sponsored[_user][_mid] += _amount;
+        _recomputeTapExit(_user, _mid);
 
-        // Recompute this sub's dropoff (it now lasts longer)
-        _recomputeSubDropoff(_user, _sid);
-
-        emit Sponsored(_user, _sid, _amount);
+        emit Transfer(msg.sender, address(this), _amount);
+        emit Sponsored(_user, _mid, _amount);
     }
 
     // ──────────────────────────────────────────────
@@ -373,18 +363,18 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     function _mint(address _user, uint128 _amount) internal {
-        _checkpoint(_user);
-        _users[_user].principal += _amount;
+        _settle(_user);
+        _accounts[_user].principal += _amount;
         totalMinted += _amount;
-        _recomputeAllDropoffs(_user);
+        _recomputeAllExits(_user);
         emit Transfer(address(0), _user, _amount);
     }
 
     function _spend(address _user, uint128 _amount) internal {
-        _checkpoint(_user);
+        _settle(_user);
         if (_balance(_user) < _amount) revert InsufficientBalance();
-        _users[_user].principal -= _amount;
-        _recomputeAllDropoffs(_user);
+        _accounts[_user].principal -= _amount;
+        _recomputeAllExits(_user);
         totalSpent += _amount;
         emit Transfer(_user, address(0), _amount);
         emit Spent(_user, _amount);
@@ -394,154 +384,98 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (_from == address(0)) revert ERC20InvalidSender(address(0));
         if (_to == address(0)) revert ERC20InvalidReceiver(address(0));
 
-        _checkpoint(_from);
+        _settle(_from);
         if (_balance(_from) < _amount) revert InsufficientBalance();
-        _users[_from].principal -= uint128(_amount);
-        _recomputeAllDropoffs(_from);
+        _accounts[_from].principal -= uint128(_amount);
+        _recomputeAllExits(_from);
 
-        _checkpoint(_to);
-        _users[_to].principal += uint128(_amount);
-        _recomputeAllDropoffs(_to);
+        _settle(_to);
+        _accounts[_to].principal += uint128(_amount);
+        _recomputeAllExits(_to);
 
         emit Transfer(_from, _to, _amount);
     }
 
-    /// @dev Internal transfer helper for sponsor (moves tokens from sender to contract).
-    function _transferFrom(address _from, address _to, uint128 _amount) internal {
-        _checkpoint(_from);
+    /// @dev Debit principal from a user (for sponsor). Settles + balance check.
+    function _debit(address _from, uint128 _amount) internal {
+        _settle(_from);
         if (_balance(_from) < _amount) revert InsufficientBalance();
-        _users[_from].principal -= _amount;
-        _recomputeAllDropoffs(_from);
-
-        if (_to == address(this)) {
-            // Tokens held by contract for sponsorship — still in totalSupply
-        } else {
-            _checkpoint(_to);
-            _users[_to].principal += _amount;
-            _recomputeAllDropoffs(_to);
-        }
-
-        emit Transfer(_from, _to, _amount);
+        _accounts[_from].principal -= _amount;
+        _recomputeAllExits(_from);
     }
 
-    /// @dev Assign a schedule to a user.
-    function _assign(address _user, address _beneficiary, uint128 _rate) internal {
-        if (_rate == 0) revert InvalidSchedule();
+    /// @dev Tap a user into a mandate.
+    function _tap(address _user, address _beneficiary, uint128 _rate) internal {
+        if (_rate == 0) revert InvalidMandate();
         if (_beneficiary == _user) revert InvalidBeneficiary();
 
-        _checkpoint(_user);
+        _settle(_user);
 
-        UserState storage u = _users[_user];
-        bytes32 sid = _scheduleId(_beneficiary, _rate);
+        Account storage a = _accounts[_user];
+        bytes32 mid = _mandateId(_beneficiary, _rate);
 
-        // Can't double-subscribe to same schedule
-        if (_subs[_user][sid].rate > 0) revert InvalidSchedule();
-        if (_userSubs[_user].length >= uint256(MAX_SUBS)) revert MaxSubscriptions();
-
-        // Ensure config exists
-        if (_configs[sid].beneficiary == address(0)) {
-            _configs[sid] = ScheduleConfig(_beneficiary, _rate);
-            emit ScheduleListed(sid, _beneficiary, _rate);
-        }
+        if (_taps[_user][mid].rate > 0) revert InvalidMandate();
+        if (_userTaps[_user].length >= uint256(MAX_TAPS)) revert MaxTaps();
 
         // Immediate first-term payment
         if (_balance(_user) < _rate) revert InsufficientBalance();
-        u.principal -= _rate;
+        a.principal -= _rate;
 
         if (_beneficiary == address(0)) {
-            // Burn path
             totalBurned += _rate;
             emit Transfer(_user, address(0), _rate);
         } else {
-            // Beneficiary path
-            _users[_beneficiary].principal += _rate;
+            _accounts[_beneficiary].principal += _rate;
             emit Transfer(_user, _beneficiary, _rate);
         }
 
-        // Update user state
-        u.totalRate += _rate;
-        _userAnchor[_user] = uint32(_today());
+        // Update account
+        a.outflow += _rate;
+        _anchor[_user] = uint32(_today());
 
-        // Create subscription
+        // Create tap
         uint256 curEpoch = _epochOf();
-        _subs[_user][sid] = Subscription(_rate, uint32(curEpoch + 1), 0);
-        _userSubs[_user].push(sid);
+        _taps[_user][mid] = Tap(_rate, uint32(curEpoch + 1), 0);
+        _userTaps[_user].push(mid);
 
         // Bucket accounting (skip for burn)
         if (_beneficiary != address(0)) {
-            _joinoffs[sid][curEpoch + 1]++;
+            _entries[mid][curEpoch + 1]++;
         }
 
-        // Recompute all dropoffs (totalRate changed)
-        _recomputeAllDropoffs(_user);
+        _recomputeAllExits(_user);
 
-        emit ScheduleSet(_user, sid, _beneficiary, _rate);
+        emit Tapped(_user, mid, _beneficiary, _rate);
         _notifyListener(_user, true);
     }
 
-    /// @dev Terminate a specific subscription.
-    function _terminate(address _user, bytes32 _sid) internal {
-        Subscription storage sub = _subs[_user][_sid];
-        if (sub.rate == 0) revert ScheduleNotFound();
-        if (sub.terminatedAt > 0) revert NoSchedule();
+    /// @dev Revoke a mandate. Service continues through current period.
+    function _revoke(address _user, bytes32 _mid) internal {
+        Tap storage t = _taps[_user][_mid];
+        if (t.rate == 0) revert TapNotFound();
+        if (t.revokedAt > 0) revert NotActive();
 
-        sub.terminatedAt = uint32(_today());
+        t.revokedAt = uint32(_today());
 
-        UserState storage u = _users[_user];
-        u.totalRate -= sub.rate;
-        _userAnchor[_user] = uint32(_today());
+        Account storage a = _accounts[_user];
+        a.outflow -= t.rate;
+        _anchor[_user] = uint32(_today());
 
-        // Move dropoff for beneficiary schedules
-        ScheduleConfig storage cfg = _configs[_sid];
-        if (cfg.beneficiary != address(0)) {
-            uint32 oldDropoff = _subDropoffEpoch[_user][_sid];
-            uint256 svcEndEpoch = _epochOf() + 1; // service until end of current period
-            if (oldDropoff > 0) _dropoffs[_sid][uint256(oldDropoff)]--;
-            _dropoffs[_sid][svcEndEpoch + 1]++;
-            _subDropoffEpoch[_user][_sid] = uint32(svcEndEpoch + 1);
+        // Move exit for beneficiary mandates
+        if (_mandateId(address(0), t.rate) != _mid) {
+            // Not a burn mandate — has a real beneficiary
+            uint32 oldExit = _mandateExitEpoch[_user][_mid];
+            uint256 svcEndEpoch = _epochOf() + 1;
+            if (oldExit > 0) _exits[_mid][uint256(oldExit)]--;
+            _exits[_mid][svcEndEpoch + 1]++;
+            _mandateExitEpoch[_user][_mid] = uint32(svcEndEpoch + 1);
         }
 
-        // Remove from _userSubs (shift to preserve priority order)
-        _removeFromUserSubs(_user, _sid);
+        _removeFromUserTaps(_user, _mid);
+        _recomputeAllExits(_user);
 
-        // Recompute remaining subs' dropoffs (totalRate changed)
-        _recomputeAllDropoffs(_user);
-
-        emit ScheduleTerminated(_user, _sid, sub.terminatedAt);
-        if (_userSubs[_user].length == 0) _notifyListener(_user, false);
-    }
-
-    /// @dev Clear a subscription immediately (no service continuation).
-    function _clear(address _user, bytes32 _sid) internal {
-        Subscription storage sub = _subs[_user][_sid];
-        if (sub.rate == 0) revert ScheduleNotFound();
-
-        UserState storage u = _users[_user];
-        u.totalRate -= sub.rate;
-        _userAnchor[_user] = uint32(_today());
-
-        // Remove from buckets
-        ScheduleConfig storage cfg = _configs[_sid];
-        if (cfg.beneficiary != address(0)) {
-            _removeSubFromBuckets(_user, _sid);
-        }
-
-        // Clean up
-        delete _subs[_user][_sid];
-        delete _subDropoffEpoch[_user][_sid];
-        _removeFromUserSubs(_user, _sid);
-
-        // Return any sponsored balance (burn it or return — for now, burn)
-        uint256 sponsoredBal = _sponsored[_user][_sid];
-        if (sponsoredBal > 0) {
-            delete _sponsored[_user][_sid];
-            totalBurned += sponsoredBal;
-        }
-
-        _recomputeAllDropoffs(_user);
-
-        emit ScheduleCleared(_user, _sid);
-        if (_userSubs[_user].length == 0) _notifyListener(_user, false);
+        emit Revoked(_user, _mid, t.revokedAt);
+        if (_userTaps[_user].length == 0) _notifyListener(_user, false);
     }
 
     // ──────────────────────────────────────────────
@@ -553,38 +487,38 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     function _balance(address _user) internal view returns (uint256) {
-        UserState storage u = _users[_user];
-        if (u.totalRate == 0) return uint256(u.principal);
+        Account storage a = _accounts[_user];
+        if (a.outflow == 0) return uint256(a.principal);
         uint256 c = _consumed(_user);
-        return uint256(u.principal) - c;
+        return uint256(a.principal) - c;
     }
 
     function _consumed(address _user) internal view returns (uint256) {
-        UserState storage u = _users[_user];
-        if (u.totalRate == 0) return 0;
+        Account storage a = _accounts[_user];
+        if (a.outflow == 0) return 0;
         uint256 elapsed = _periodsElapsed(_user);
-        uint256 funded = _funded(u);
+        uint256 funded = _funded(a);
         uint256 effective = elapsed < funded ? elapsed : funded;
-        return effective * uint256(u.totalRate);
+        return effective * uint256(a.outflow);
     }
 
     function _periodsElapsed(address _user) internal view returns (uint256) {
-        uint32 anchor = _userAnchor[_user];
+        uint32 anch = _anchor[_user];
         uint256 today = _today();
-        if (today <= uint256(anchor)) return 0;
-        return (today - uint256(anchor)) / uint256(TERM_DAYS);
+        if (today <= uint256(anch)) return 0;
+        return (today - uint256(anch)) / uint256(TERM_DAYS);
     }
 
-    function _funded(UserState storage _u) internal view returns (uint256) {
-        if (_u.totalRate == 0) return 0;
-        return uint256(_u.principal) / uint256(_u.totalRate);
+    function _funded(Account storage _a) internal view returns (uint256) {
+        if (_a.outflow == 0) return 0;
+        return uint256(_a.principal) / uint256(_a.outflow);
     }
 
     // ──────────────────────────────────────────────
     // Internal: Epoch helpers
     // ──────────────────────────────────────────────
 
-    function _scheduleId(address _beneficiary, uint128 _rate) internal pure returns (bytes32) {
+    function _mandateId(address _beneficiary, uint128 _rate) internal pure returns (bytes32) {
         return keccak256(abi.encode(_beneficiary, _rate));
     }
 
@@ -595,92 +529,81 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     // ──────────────────────────────────────────────
-    // Internal: Checkpoint + Settlement
+    // Internal: Settlement
     // ──────────────────────────────────────────────
 
-    /// @dev Checkpoint: settle consumed, reset anchor. Called on every interaction.
-    ///      If lapsed, triggers priority resolution.
-    function _checkpoint(address _user) internal {
-        UserState storage u = _users[_user];
-        if (u.totalRate == 0) return;
+    /// @dev Settle: deduct consumed, reset anchor. On lapse, resolve priority.
+    function _settle(address _user) internal {
+        Account storage a = _accounts[_user];
+        if (a.outflow == 0) return;
 
         uint256 elapsed = _periodsElapsed(_user);
         if (elapsed == 0) return;
 
-        uint256 funded = _funded(u);
+        uint256 funded = _funded(a);
         uint256 periods = elapsed < funded ? elapsed : funded;
-        uint256 consumed = periods * uint256(u.totalRate);
+        uint256 con = periods * uint256(a.outflow);
 
-        if (consumed > 0) {
-            u.principal -= uint128(consumed);
-            // Accounting: for mixed burn+beneficiary, we attribute to totalBurned
-            // only during priority resolution when we know which subs are burn.
-            // For now, the consumed tokens are "in transit" (backed by bucket system
-            // for beneficiary subs, or implicitly burned for burn subs).
-            emit ScheduleSettled(_user, consumed);
+        if (con > 0) {
+            a.principal -= uint128(con);
+            emit Settled(_user, con);
         }
 
-        _userAnchor[_user] = uint32(_today());
+        _anchor[_user] = uint32(_today());
 
-        // If lapsed: priority resolution
         if (elapsed > funded) {
             _resolvePriority(_user);
         }
     }
 
-    /// @dev Priority resolution: process subs in subscription order.
-    ///      Higher priority survives with remaining funds + sponsored.
+    /// @dev Priority resolution: first-tapped survives, later taps lapse.
     function _resolvePriority(address _user) internal {
-        UserState storage u = _users[_user];
-        uint256 remaining = uint256(u.principal);
-        bytes32[] storage subs = _userSubs[_user];
+        Account storage a = _accounts[_user];
+        uint256 remaining = uint256(a.principal);
+        bytes32[] storage taps = _userTaps[_user];
 
-        // Process in priority order — iterate backward for safe removal
         uint256 i = 0;
-        while (i < subs.length) {
-            bytes32 sid = subs[i];
-            Subscription storage sub = _subs[_user][sid];
-            uint256 sponsoredBal = _sponsored[_user][sid];
+        while (i < taps.length) {
+            bytes32 mid = taps[i];
+            Tap storage t = _taps[_user][mid];
+            uint256 sponsoredBal = _sponsored[_user][mid];
             uint256 avail = remaining + sponsoredBal;
 
-            if (avail >= uint256(sub.rate)) {
-                // Survives one more period
-                if (sponsoredBal >= uint256(sub.rate)) {
-                    _sponsored[_user][sid] = sponsoredBal - uint256(sub.rate);
+            if (avail >= uint256(t.rate)) {
+                if (sponsoredBal >= uint256(t.rate)) {
+                    _sponsored[_user][mid] = sponsoredBal - uint256(t.rate);
                 } else {
-                    uint256 fromPrincipal = uint256(sub.rate) - sponsoredBal;
-                    _sponsored[_user][sid] = 0;
+                    uint256 fromPrincipal = uint256(t.rate) - sponsoredBal;
+                    _sponsored[_user][mid] = 0;
                     remaining -= fromPrincipal;
                 }
                 i++;
             } else {
-                // Lapses — clean up
-                ScheduleConfig storage cfg = _configs[sid];
-                if (cfg.beneficiary != address(0)) {
-                    _removeSubFromBuckets(_user, sid);
+                // Lapse — clean up
+                bool isBurn = _mandateId(address(0), t.rate) == mid;
+                if (!isBurn) {
+                    _removeTapFromBuckets(_user, mid);
                 }
-                u.totalRate -= sub.rate;
-                delete _subs[_user][sid];
-                delete _subDropoffEpoch[_user][sid];
+                a.outflow -= t.rate;
+                delete _taps[_user][mid];
+                delete _mandateExitEpoch[_user][mid];
                 if (sponsoredBal > 0) {
-                    delete _sponsored[_user][sid];
-                    totalBurned += sponsoredBal;
+                    delete _sponsored[_user][mid];
+                    // Sponsored tokens were already counted as totalSpent on sponsor()
                 }
 
-                // Shift array (preserve priority order)
-                for (uint256 j = i; j < subs.length - 1; j++) {
-                    subs[j] = subs[j + 1];
+                for (uint256 j = i; j < taps.length - 1; j++) {
+                    taps[j] = taps[j + 1];
                 }
-                subs.pop();
-                // Don't increment i — next element shifted into position
+                taps.pop();
 
-                emit ScheduleCleared(_user, sid);
+                emit Revoked(_user, mid, uint32(_today()));
             }
         }
 
-        u.principal = uint128(remaining);
+        a.principal = uint128(remaining);
 
-        if (subs.length == 0) {
+        if (taps.length == 0) {
             _notifyListener(_user, false);
         }
     }
@@ -689,86 +612,81 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Bucket Management
     // ──────────────────────────────────────────────
 
-    /// @dev Recompute dropoffs for ALL of a user's active subscriptions.
-    function _recomputeAllDropoffs(address _user) internal {
-        UserState storage u = _users[_user];
-        bytes32[] storage subs = _userSubs[_user];
+    function _recomputeAllExits(address _user) internal {
+        Account storage a = _accounts[_user];
+        bytes32[] storage taps = _userTaps[_user];
         uint256 curEpoch = _epochOf();
-        uint256 sharedFunded = _funded(u);
+        uint256 sharedFunded = _funded(a);
 
-        for (uint256 i; i < subs.length; i++) {
-            bytes32 sid = subs[i];
-            ScheduleConfig storage cfg = _configs[sid];
-            if (cfg.beneficiary == address(0)) continue; // skip burn
+        for (uint256 i; i < taps.length; i++) {
+            bytes32 mid = taps[i];
+            bool isBurn = _mandateId(address(0), _taps[_user][mid].rate) == mid;
+            if (isBurn) continue;
 
-            uint256 extraFunded = _sponsored[_user][sid] / uint256(_subs[_user][sid].rate);
-            uint256 newDropoff = curEpoch + 1 + sharedFunded + extraFunded;
-            uint32 oldDropoff = _subDropoffEpoch[_user][sid];
+            uint256 extraFunded = _sponsored[_user][mid] / uint256(_taps[_user][mid].rate);
+            uint256 newExit = curEpoch + 1 + sharedFunded + extraFunded;
+            uint32 oldExit = _mandateExitEpoch[_user][mid];
 
-            if (uint256(oldDropoff) != newDropoff) {
-                if (oldDropoff > 0) _dropoffs[sid][uint256(oldDropoff)]--;
-                _dropoffs[sid][newDropoff]++;
-                _subDropoffEpoch[_user][sid] = uint32(newDropoff);
+            if (uint256(oldExit) != newExit) {
+                if (oldExit > 0) _exits[mid][uint256(oldExit)]--;
+                _exits[mid][newExit]++;
+                _mandateExitEpoch[_user][mid] = uint32(newExit);
             }
         }
     }
 
-    /// @dev Recompute dropoff for a single subscription.
-    function _recomputeSubDropoff(address _user, bytes32 _sid) internal {
-        ScheduleConfig storage cfg = _configs[_sid];
-        if (cfg.beneficiary == address(0)) return;
+    function _recomputeTapExit(address _user, bytes32 _mid) internal {
+        bool isBurn = _mandateId(address(0), _taps[_user][_mid].rate) == _mid;
+        if (isBurn) return;
 
-        UserState storage u = _users[_user];
+        Account storage a = _accounts[_user];
         uint256 curEpoch = _epochOf();
-        uint256 sharedFunded = _funded(u);
-        uint256 extraFunded = _sponsored[_user][_sid] / uint256(_subs[_user][_sid].rate);
-        uint256 newDropoff = curEpoch + 1 + sharedFunded + extraFunded;
-        uint32 oldDropoff = _subDropoffEpoch[_user][_sid];
+        uint256 sharedFunded = _funded(a);
+        uint256 extraFunded = _sponsored[_user][_mid] / uint256(_taps[_user][_mid].rate);
+        uint256 newExit = curEpoch + 1 + sharedFunded + extraFunded;
+        uint32 oldExit = _mandateExitEpoch[_user][_mid];
 
-        if (uint256(oldDropoff) != newDropoff) {
-            if (oldDropoff > 0) _dropoffs[_sid][uint256(oldDropoff)]--;
-            _dropoffs[_sid][newDropoff]++;
-            _subDropoffEpoch[_user][_sid] = uint32(newDropoff);
+        if (uint256(oldExit) != newExit) {
+            if (oldExit > 0) _exits[_mid][uint256(oldExit)]--;
+            _exits[_mid][newExit]++;
+            _mandateExitEpoch[_user][_mid] = uint32(newExit);
         }
     }
 
-    /// @dev Remove a subscription's joinoff and dropoff from buckets.
-    function _removeSubFromBuckets(address _user, bytes32 _sid) internal {
-        Checkpoint storage cp = _checkpoints[_sid];
-        Subscription storage sub = _subs[_user][_sid];
+    function _removeTapFromBuckets(address _user, bytes32 _mid) internal {
+        Checkpoint storage cp = _checkpoints[_mid];
+        Tap storage t = _taps[_user][_mid];
 
-        uint256 joinEpoch = uint256(sub.joinedAtEpoch);
-        if (joinEpoch > uint256(cp.lastEpoch)) {
-            uint256 j = _joinoffs[_sid][joinEpoch];
-            if (j > 0) _joinoffs[_sid][joinEpoch] = j - 1;
+        uint256 entryEpoch = uint256(t.entryEpoch);
+        if (entryEpoch > uint256(cp.lastEpoch)) {
+            uint256 e = _entries[_mid][entryEpoch];
+            if (e > 0) _entries[_mid][entryEpoch] = e - 1;
         }
 
-        uint32 dropoffEpoch = _subDropoffEpoch[_user][_sid];
-        if (dropoffEpoch > 0 && uint256(dropoffEpoch) > uint256(cp.lastEpoch)) {
-            uint256 d = _dropoffs[_sid][uint256(dropoffEpoch)];
-            if (d > 0) _dropoffs[_sid][uint256(dropoffEpoch)] = d - 1;
+        uint32 exitEpoch = _mandateExitEpoch[_user][_mid];
+        if (exitEpoch > 0 && uint256(exitEpoch) > uint256(cp.lastEpoch)) {
+            uint256 x = _exits[_mid][uint256(exitEpoch)];
+            if (x > 0) _exits[_mid][uint256(exitEpoch)] = x - 1;
         }
     }
 
-    /// @dev Remove a scheduleId from _userSubs array (shift to preserve order).
-    function _removeFromUserSubs(address _user, bytes32 _sid) internal {
-        bytes32[] storage subs = _userSubs[_user];
-        for (uint256 i; i < subs.length; i++) {
-            if (subs[i] == _sid) {
-                for (uint256 j = i; j < subs.length - 1; j++) {
-                    subs[j] = subs[j + 1];
+    function _removeFromUserTaps(address _user, bytes32 _mid) internal {
+        bytes32[] storage taps = _userTaps[_user];
+        for (uint256 i; i < taps.length; i++) {
+            if (taps[i] == _mid) {
+                for (uint256 j = i; j < taps.length - 1; j++) {
+                    taps[j] = taps[j + 1];
                 }
-                subs.pop();
+                taps.pop();
                 return;
             }
         }
     }
 
-    /// @dev Check if user has any active sponsored schedule.
     function _hasAnySponsoredActive(address _user) internal view returns (bool) {
-        bytes32[] storage subs = _userSubs[_user];
-        for (uint256 i; i < subs.length; i++) {
-            if (_sponsored[_user][subs[i]] > 0) return true;
+        bytes32[] storage taps = _userTaps[_user];
+        for (uint256 i; i < taps.length; i++) {
+            if (_sponsored[_user][taps[i]] > 0) return true;
         }
         return false;
     }
@@ -777,9 +695,9 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Listener
     // ──────────────────────────────────────────────
 
-    function _setScheduleListener(address _listener) internal {
+    function _setListener(address _listener) internal {
         scheduleListener = _listener;
-        emit ScheduleListenerSet(_listener);
+        emit ListenerSet(_listener);
     }
 
     function _notifyListener(address _user, bool _active) internal {
