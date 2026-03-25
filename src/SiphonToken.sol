@@ -286,6 +286,21 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     // ──────────────────────────────────────────────
+    // Public: Terminate
+    // ──────────────────────────────────────────────
+
+    /// @notice Terminate a user's schedule. Callable by the user or the beneficiary.
+    ///         The schedule stays active through the current paid period, then clears
+    ///         on next settle. Like revoking an autopay at the bank — service continues
+    ///         until the paid period runs out.
+    function terminate(address _user) external virtual {
+        Schedule storage s = _schedules[_user];
+        if (s.rate == 0) revert NoSchedule();
+        if (msg.sender != _user && msg.sender != s.to) revert InvalidBeneficiary();
+        _terminateSchedule(_user);
+    }
+
+    // ──────────────────────────────────────────────
     // Public: Assign (beneficiary sets schedule for user)
     // ──────────────────────────────────────────────
 
