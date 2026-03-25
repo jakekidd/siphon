@@ -67,6 +67,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     error InvalidBeneficiary();
     error InvalidSchedule();
     error NotApproved();
+    error Unauthorized();
 
     // ──────────────────────────────────────────────
     // Events
@@ -296,7 +297,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function terminate(address _user) external virtual {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) revert NoSchedule();
-        if (msg.sender != _user && msg.sender != s.to) revert InvalidBeneficiary();
+        if (msg.sender != _user && msg.sender != s.to) revert Unauthorized();
         _terminateSchedule(_user);
     }
 
