@@ -80,6 +80,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     event ScheduleCleared(address indexed user);
     event ScheduleSettled(address indexed user, uint256 amount);
     event ScheduleApproval(address indexed user, bytes32 indexed scheduleId, uint256 count);
+    event ScheduleComped(address indexed user, bytes32 indexed scheduleId, uint8 periods);
     event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
     event Collected(address indexed beneficiary, bytes32 indexed scheduleId, uint256 amount, uint256 epochs);
@@ -503,6 +504,43 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         s.terminatedAt = uint32(_today());
         emit ScheduleTerminated(_user, s.terminatedAt);
+    }
+
+    /// @dev Beneficiary comps N periods for a user. Settles consumed, moves anchor
+    ///      forward by N intervals, writes dropoff (user pauses paying) and joinoff
+    ///      (user resumes after N free periods). Existing dropoff stays for when
+    ///      funds run out. Only for beneficiary schedules.
+    function _comp(address _user, uint8 _periods) internal {
+        Schedule storage s = _schedules[_user];
+        if (s.rate == 0) revert NoSchedule();
+        if (s.to == address(0)) revert InvalidBeneficiary();
+        if (s.terminatedAt > 0) revert NoSchedule();
+        if (_expiry(s) <= _today()) revert NoSchedule();
+        if (_periods == 0) revert InvalidSchedule();
+
+        bytes32 sid = _scheduleId(s.to, s.rate, s.interval);
+        uint256 currentEpoch = _epochOf(s.interval);
+
+        // Settle consumed so far, move anchor forward by N intervals
+        _settleConsumed(s, _user);
+        s.anchor = uint32(_today());
+
+        // User stops paying at next epoch, resumes after N free epochs
+        _dropoffs[sid][currentEpoch + 1]++;
+        _joinoffs[sid][currentEpoch + 1 + uint256(_periods)]++;
+
+        // Recalculate dropoff from new anchor (funded periods may differ)
+        uint256 fundedTerms = uint256(s.principal) / uint256(s.rate);
+        uint256 oldDropoff = uint256(_userDropoffEpoch[_user]);
+        uint256 newDropoff = currentEpoch + 1 + uint256(_periods) + fundedTerms;
+
+        if (oldDropoff > 0 && oldDropoff != newDropoff) {
+            _dropoffs[sid][oldDropoff]--;
+        }
+        _dropoffs[sid][newDropoff]++;
+        _userDropoffEpoch[_user] = uint32(newDropoff);
+
+        emit ScheduleComped(_user, sid, _periods);
     }
 
     function _clearSchedule(address _user) internal {

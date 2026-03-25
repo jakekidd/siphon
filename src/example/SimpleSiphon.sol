@@ -48,6 +48,7 @@ contract SimpleSiphon is SiphonToken {
         _setSchedule(_user, _rate, _interval);
     }
 
+    function comp(address _user, uint8 _periods) external onlyScheduler { _comp(_user, _periods); }
     function terminateSchedule(address _user) external onlyScheduler { _terminateSchedule(_user); }
     function clearSchedule(address _user) external onlyScheduler { _clearSchedule(_user); }
 
