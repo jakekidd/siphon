@@ -16,32 +16,40 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  * @dev Key concepts:
  *
  *   SIPHONING (period-based, not streaming)
- *     Each period's full cost is committed when the period starts. If you're
- *     1 day into a 30-day period, the full period is consumed. This is how
- *     real subscriptions work, not per-second streaming.
+ *     Payments happen at period boundaries (anchor + n*interval). The first
+ *     term is paid immediately on assign. Subsequent deductions occur at each
+ *     boundary via lazy math.
  *
- *   GRACE PERIODS (prepaid)
- *     Schedules can have gracePeriods — periods where no principal is consumed.
- *     After grace, normal siphoning resumes. Adding grace to an active schedule
- *     settles consumed so far and restarts the anchor from today.
+ *   TWO PATHS: BURN vs BENEFICIARY
+ *     to == address(0): consumed tokens are burned (totalSupply decreases).
+ *     to != address(0): consumed tokens flow to a beneficiary via shared
+ *     count buckets (joinoffs + dropoffs). The beneficiary calls collect().
+ *
+ *   SCHEDULE APPROVAL
+ *     Users pre-approve schedules by ID: approveSchedule(scheduleId, count).
+ *     Each assignment consumes one approval. type(uint256).max = infinite
+ *     (beneficiary can reassign freely, e.g. auto-renew after lapse).
+ *     Lapse or termination does NOT revoke remaining approvals.
+ *
+ *   SHARED COUNT BUCKETS
+ *     scheduleId = keccak256(beneficiary, rate, termDays). All subscribers
+ *     share count buckets. O(1) per user mutation, O(epochs) collect.
+ *
+ *   ONLY FULLY FUNDED PERIODS
+ *     consumed = min(periodsElapsed, fundedPeriods) * rate, where
+ *     fundedPeriods = principal / rate (floor division).
  *
  *   LAZY SETTLEMENT
- *     balanceOf is computed on-the-fly from (principal, rate, anchor, interval).
- *     Storage only changes on interaction via _settle. No keeper, no cron.
+ *     balanceOf computed on-the-fly. Storage only changes via _settle.
  *
- *   FULLY TRANSFERABLE
- *     Standard ERC20 transfer/approve/transferFrom. Override to restrict.
- *     Schedule math automatically adjusts: transfers change principal,
- *     which changes funded periods and expiry.
+ *   LAPSE = DONE
+ *     Lapse always clears the schedule. To resume, the user must re-approve
+ *     and the beneficiary must re-assign. No auto-resume on deposit.
  *
  *   SCHEDULE STRUCT — TWO STORAGE SLOTS
  *     Slot 1: { uint128 principal, uint128 rate }
- *     Slot 2: { uint32 interval, uint48 anchor, uint48 terminatedAt,
- *               uint16 cap, uint16 gracePeriods }  [96 bits free]
- *
- *   IMPLEMENTER RESPONSIBILITIES
- *     Concrete contracts must implement: name(), symbol(), decimals(),
- *     _maxTotalPeriods(). Override transfer/transferFrom to restrict.
+ *     Slot 2: { address to, uint16 interval, uint32 anchor,
+ *               uint32 terminatedAt }  [16 bits free]
  */
 abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
@@ -49,22 +57,32 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     error InsufficientBalance();
+    /// @notice ERC20 standard error (OpenZeppelin ERC20Errors.sol).
     error InsufficientAllowance();
     error NoSchedule();
+    /// @notice ERC20 standard error (OpenZeppelin ERC20Errors.sol).
     error ERC20InvalidReceiver(address receiver);
+    /// @notice ERC20 standard error (OpenZeppelin ERC20Errors.sol).
     error ERC20InvalidSender(address sender);
+    error InvalidBeneficiary();
+    error InvalidSchedule();
+    error NotApproved();
 
     // ──────────────────────────────────────────────
     // Events
     // ──────────────────────────────────────────────
 
-    event ScheduleSet(address indexed user, uint128 rate, uint32 interval, uint16 cap, uint16 gracePeriods);
-    event ScheduleTerminated(address indexed user, uint48 terminatedAt);
+    event ScheduleSet(
+        address indexed user, address indexed to, uint128 rate,
+        uint16 interval, bytes32 scheduleId
+    );
+    event ScheduleTerminated(address indexed user, uint32 terminatedAt);
     event ScheduleCleared(address indexed user);
     event ScheduleSettled(address indexed user, uint256 amount);
-    event GracePeriodsSet(address indexed user, uint16 gracePeriods);
-    event Siphoned(address indexed user, uint256 amount);
+    event ScheduleApproval(address indexed user, bytes32 indexed scheduleId, uint256 count);
+    event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
+    event Collected(address indexed beneficiary, bytes32 indexed scheduleId, uint256 amount, uint256 epochs);
     event ScheduleListenerSet(address listener);
 
     // ──────────────────────────────────────────────
@@ -74,17 +92,22 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     /**
      * @dev Two storage slots per user.
      *   Slot 1 (256 bits): principal (128) + rate (128)
-     *   Slot 2 (256 bits): interval (32) + anchor (48) + terminatedAt (48)
-     *                      + cap (16) + gracePeriods (16) = 160 [96 free]
+     *   Slot 2 (256 bits): to (160) + interval (16) + anchor (32)
+     *                      + terminatedAt (32) = 240  [16 bits free]
      */
     struct Schedule {
-        uint128 principal; // base balance (reduced by settle + spend)
-        uint128 rate; // amount siphoned per period (0 = no schedule)
-        uint32 interval; // period length in days
-        uint48 anchor; // dayIndex when schedule started
-        uint48 terminatedAt; // dayIndex when terminated (0 = active)
-        uint16 cap; // user limit on total periods (0 = auto)
-        uint16 gracePeriods; // prepaid periods not siphoned
+        uint128 principal;
+        uint128 rate;
+        address to;
+        uint16 interval;
+        uint32 anchor;
+        uint32 terminatedAt;
+    }
+
+    /// @dev Collection checkpoint per scheduleId. Packed in one slot.
+    struct Checkpoint {
+        uint32 lastEpoch;
+        uint224 count;
     }
 
     // ──────────────────────────────────────────────
@@ -94,52 +117,68 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     uint256 internal constant _SECONDS_PER_DAY = 86_400;
 
     // ──────────────────────────────────────────────
+    // Immutables
+    // ──────────────────────────────────────────────
+
+    /// @notice Day index when the contract was deployed. Epoch boundaries are relative to this.
+    uint32 public immutable DEPLOY_DAY;
+
+    // ──────────────────────────────────────────────
     // State
     // ──────────────────────────────────────────────
 
     mapping(address => Schedule) internal _schedules;
     mapping(address => mapping(address => uint256)) internal _allowances;
+
     uint256 public totalMinted;
-    uint256 public totalSiphoned;
+    uint256 public totalBurned;
     uint256 public totalSpent;
+
+    /// @dev Schedule approval counts. user => scheduleId => remaining approvals.
+    ///      type(uint256).max = infinite (beneficiary can reassign freely).
+    mapping(address => mapping(bytes32 => uint256)) internal _scheduleApprovals;
+
+    /// @dev Collection checkpoints per scheduleId.
+    mapping(bytes32 => Checkpoint) internal _checkpoints;
+
+    /// @dev Subscriber joinoff counts. scheduleId => epochNumber => count.
+    mapping(bytes32 => mapping(uint256 => uint256)) internal _joinoffs;
+
+    /// @dev Subscriber dropoff counts. scheduleId => epochNumber => count.
+    mapping(bytes32 => mapping(uint256 => uint256)) internal _dropoffs;
+
+    /// @dev Per-user hint: which epoch their dropoff is placed at.
+    mapping(address => uint32) internal _userDropoffEpoch;
 
     /// @notice Optional callback for schedule state changes.
     address public scheduleListener;
 
     // ──────────────────────────────────────────────
-    // Abstract — must implement
+    // Constructor
     // ──────────────────────────────────────────────
 
-    /// @dev Global safety cap on total periods (grace + funded). 0 = unlimited.
-    function _maxTotalPeriods() internal pure virtual returns (uint256);
+    constructor(uint32 _deployDay) {
+        DEPLOY_DAY = _deployDay == 0 ? uint32(block.timestamp / _SECONDS_PER_DAY) : _deployDay;
+    }
 
     // ──────────────────────────────────────────────
     // ERC20
     // ──────────────────────────────────────────────
 
-    function balanceOf(
-        address _user
-    ) external view returns (uint256) {
+    function balanceOf(address _user) external view returns (uint256) {
         return _balance(_schedules[_user]);
     }
 
     function totalSupply() external view returns (uint256) {
-        return totalMinted - totalSiphoned - totalSpent;
+        return totalMinted - totalBurned - totalSpent;
     }
 
-    function transfer(
-        address _to,
-        uint256 _amount
-    ) external virtual returns (bool) {
+    function transfer(address _to, uint256 _amount) external virtual returns (bool) {
         _transfer(msg.sender, _to, _amount);
         return true;
     }
 
-    function transferFrom(
-        address _from,
-        address _to,
-        uint256 _amount
-    ) external virtual returns (bool) {
+    function transferFrom(address _from, address _to, uint256 _amount) external virtual returns (bool) {
         uint256 allowed = _allowances[_from][msg.sender];
         if (allowed != type(uint256).max) {
             if (allowed < _amount) revert InsufficientAllowance();
@@ -149,98 +188,166 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return true;
     }
 
-    function approve(
-        address _spender,
-        uint256 _amount
-    ) external virtual returns (bool) {
+    function approve(address _spender, uint256 _amount) external virtual returns (bool) {
         _allowances[msg.sender][_spender] = _amount;
         emit Approval(msg.sender, _spender, _amount);
         return true;
     }
 
-    function allowance(
-        address _owner,
-        address _spender
-    ) external view returns (uint256) {
+    function allowance(address _owner, address _spender) external view returns (uint256) {
         return _allowances[_owner][_spender];
+    }
+
+    // ──────────────────────────────────────────────
+    // Schedule Approval
+    // ──────────────────────────────────────────────
+
+    /// @notice Pre-approve a schedule for assignment. Each assign() consumes one.
+    ///         Use type(uint256).max for infinite (beneficiary can reassign freely).
+    function approveSchedule(bytes32 _sid, uint256 _count) external {
+        _scheduleApprovals[msg.sender][_sid] = _count;
+        emit ScheduleApproval(msg.sender, _sid, _count);
+    }
+
+    /// @notice Check remaining schedule approvals.
+    function scheduleAllowance(address _user, bytes32 _sid) external view returns (uint256) {
+        return _scheduleApprovals[_user][_sid];
     }
 
     // ──────────────────────────────────────────────
     // Views
     // ──────────────────────────────────────────────
 
-    function getSchedule(
-        address _user
-    )
+    function getSchedule(address _user)
         external
         view
         returns (
-            uint128 principal,
-            uint128 rate,
-            uint32 interval,
-            uint48 anchor,
-            uint48 terminatedAt,
-            uint16 cap,
-            uint16 gracePeriods
+            uint128 principal, uint128 rate, address to,
+            uint16 interval, uint32 anchor, uint32 terminatedAt
         )
     {
         Schedule storage s = _schedules[_user];
-        return (s.principal, s.rate, s.interval, s.anchor, s.terminatedAt, s.cap, s.gracePeriods);
+        return (s.principal, s.rate, s.to, s.interval, s.anchor, s.terminatedAt);
     }
 
-    function consumed(
-        address _user
-    ) external view returns (uint256) {
+    function consumed(address _user) external view returns (uint256) {
         return _consumed(_schedules[_user]);
     }
 
-    function expiry(
-        address _user
-    ) external view returns (uint256) {
+    function expiry(address _user) external view returns (uint256) {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) return 0;
-        return _serviceEnd(s);
+        return _expiry(s);
     }
 
-    function isActive(
-        address _user
-    ) external view returns (bool) {
+    function isActive(address _user) external view returns (bool) {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) return false;
         if (s.terminatedAt > 0) return false;
         return _expiry(s) > _today();
     }
 
-    function isTerminated(
-        address _user
-    ) external view returns (bool) {
+    /// @notice True if user explicitly terminated and service hasn't ended yet.
+    function didTerminate(address _user) external view returns (bool) {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) return false;
         if (s.terminatedAt == 0) return false;
         return _serviceEnd(s) > _today();
     }
 
-    function isLapsed(
-        address _user
-    ) external view returns (bool) {
+    /// @notice True if user ran out of funds without terminating.
+    function didLapse(address _user) external view returns (bool) {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) return false;
         if (s.terminatedAt > 0) return false;
         return _expiry(s) <= _today();
     }
 
-    function isGracePeriod(
-        address _user
-    ) external view returns (bool) {
-        Schedule storage s = _schedules[_user];
-        if (s.rate == 0 || s.gracePeriods == 0) return false;
-        uint256 elapsed = _today() - uint256(s.anchor);
-        uint256 started = (elapsed / uint256(s.interval)) + 1;
-        return started <= uint256(s.gracePeriods);
-    }
-
     function currentDay() external view returns (uint256) {
         return _today();
+    }
+
+    function scheduleId(address _to, uint128 _rate, uint16 _interval) external pure returns (bytes32) {
+        return _scheduleId(_to, _rate, _interval);
+    }
+
+    function getCheckpoint(bytes32 _sid) external view returns (uint32 lastEpoch, uint224 count) {
+        Checkpoint storage cp = _checkpoints[_sid];
+        return (cp.lastEpoch, cp.count);
+    }
+
+    // ──────────────────────────────────────────────
+    // Public: Settle
+    // ──────────────────────────────────────────────
+
+    function settle(address _user) external {
+        _settle(_schedules[_user], _user);
+    }
+
+    // ──────────────────────────────────────────────
+    // Public: Assign (beneficiary sets schedule for user)
+    // ──────────────────────────────────────────────
+
+    /// @notice Assign a schedule to a user. Consumes one schedule approval.
+    ///         Anyone can call — the user's prior approveSchedule() is the gate.
+    ///         Immediate first-term payment is transferred directly to beneficiary.
+    function assign(
+        address _user,
+        address _to,
+        uint128 _rate,
+        uint16 _interval
+    ) external virtual {
+        bytes32 sid = _scheduleId(_to, _rate, _interval);
+        uint256 approvals = _scheduleApprovals[_user][sid];
+        if (approvals == 0) revert NotApproved();
+        if (approvals != type(uint256).max) {
+            _scheduleApprovals[_user][sid] = approvals - 1;
+        }
+        _assign(_user, _to, _rate, _interval);
+    }
+
+    // ──────────────────────────────────────────────
+    // Public: Collect (beneficiary claims income)
+    // ──────────────────────────────────────────────
+
+    /// @notice Collect accumulated income for a schedule. Anyone can call;
+    ///         tokens always go to the beneficiary encoded in the scheduleId.
+    ///         Caller provides schedule params; contract verifies hash.
+    function collect(
+        address _to,
+        uint128 _rate,
+        uint16 _interval,
+        uint256 _maxEpochs
+    ) external {
+        bytes32 sid = _scheduleId(_to, _rate, _interval);
+        Checkpoint storage cp = _checkpoints[sid];
+        uint256 current = _epochOf(_interval);
+        uint256 last = uint256(cp.lastEpoch);
+        uint256 end = last + _maxEpochs;
+        if (end > current) end = current;
+        if (end <= last) return;
+
+        uint256 running = uint256(cp.count);
+        uint256 total;
+
+        for (uint256 e = last + 1; e <= end; e++) {
+            running += _joinoffs[sid][e];
+            uint256 drops = _dropoffs[sid][e];
+            if (drops > running) drops = running;
+            running -= drops;
+            delete _joinoffs[sid][e];
+            delete _dropoffs[sid][e];
+            total += running * uint256(_rate);
+        }
+
+        cp.lastEpoch = uint32(end);
+        cp.count = uint224(running);
+
+        if (total > 0) {
+            _schedules[_to].principal += uint128(total);
+            emit Transfer(address(this), _to, total);
+            emit Collected(_to, sid, total, end - last);
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -252,6 +359,11 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         _settle(s, _user);
         s.principal += _amount;
         totalMinted += _amount;
+
+        if (s.rate > 0 && s.to != address(0)) {
+            _updateDropoff(_user, s);
+        }
+
         emit Transfer(address(0), _user, _amount);
     }
 
@@ -260,6 +372,11 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         _settle(s, _user);
         if (_balance(s) < _amount) revert InsufficientBalance();
         s.principal -= _amount;
+
+        if (s.rate > 0 && s.to != address(0)) {
+            _updateDropoff(_user, s);
+        }
+
         totalSpent += _amount;
         emit Transfer(_user, address(0), _amount);
         emit Spent(_user, _amount);
@@ -274,40 +391,93 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (_balance(fromS) < _amount) revert InsufficientBalance();
         fromS.principal -= uint128(_amount);
 
+        if (fromS.rate > 0 && fromS.to != address(0)) {
+            _updateDropoff(_from, fromS);
+        }
+
         Schedule storage toS = _schedules[_to];
         _settle(toS, _to);
         toS.principal += uint128(_amount);
 
+        if (toS.rate > 0 && toS.to != address(0)) {
+            _updateDropoff(_to, toS);
+        }
+
         emit Transfer(_from, _to, _amount);
     }
 
-    function _setSchedule(
+    /// @dev Assign a beneficiary schedule with immediate first-term payment.
+    function _assign(
         address _user,
+        address _to,
         uint128 _rate,
-        uint32 _interval,
-        uint16 _cap,
-        uint16 _gracePeriods
+        uint16 _interval
     ) internal {
-        if (_rate == 0 || _interval == 0) revert NoSchedule();
+        if (_rate == 0 || _interval == 0) revert InvalidSchedule();
+        if (_to == address(0) || _to == _user) revert InvalidBeneficiary();
 
         Schedule storage s = _schedules[_user];
 
+        // Clean up existing schedule
         if (s.rate > 0) {
+            if (s.to != address(0)) _removeUserFromBuckets(_user, s);
             _settleConsumed(s, _user);
         } else {
             _settle(s, _user);
         }
 
-        if (s.principal < _rate && _gracePeriods == 0) revert InsufficientBalance();
+        // Immediate first-term payment: direct transfer to beneficiary
+        if (_balance(s) < _rate) revert InsufficientBalance();
+        s.principal -= _rate;
+        _schedules[_to].principal += _rate;
+        emit Transfer(_user, _to, _rate);
+
+        // Set schedule
+        s.rate = _rate;
+        s.to = _to;
+        s.interval = _interval;
+        s.anchor = uint32(_today());
+        s.terminatedAt = 0;
+
+        // Bucket accounting: joinoff at next epoch (immediate payment covers current)
+        bytes32 sid = _scheduleId(_to, _rate, _interval);
+        uint256 currentEpoch = _epochOf(_interval);
+        uint256 joinEpoch = currentEpoch + 1;
+        _joinoffs[sid][joinEpoch]++;
+
+        uint256 fundedTerms = uint256(s.principal) / uint256(_rate);
+        uint256 dropoffEpoch = joinEpoch + fundedTerms;
+        _dropoffs[sid][dropoffEpoch]++;
+        _userDropoffEpoch[_user] = uint32(dropoffEpoch);
+
+        emit ScheduleSet(_user, _to, _rate, _interval, sid);
+        _notifyListener(_user, true);
+    }
+
+    /// @dev Set a burn-path schedule (to == address(0)). No bucket accounting.
+    function _setSchedule(
+        address _user,
+        uint128 _rate,
+        uint16 _interval
+    ) internal {
+        if (_rate == 0 || _interval == 0) revert InvalidSchedule();
+
+        Schedule storage s = _schedules[_user];
+
+        if (s.rate > 0) {
+            if (s.to != address(0)) _removeUserFromBuckets(_user, s);
+            _settleConsumed(s, _user);
+        } else {
+            _settle(s, _user);
+        }
 
         s.rate = _rate;
+        s.to = address(0);
         s.interval = _interval;
-        s.anchor = uint48(_today());
+        s.anchor = uint32(_today());
         s.terminatedAt = 0;
-        s.cap = _cap;
-        s.gracePeriods = _gracePeriods;
 
-        emit ScheduleSet(_user, _rate, _interval, _cap, _gracePeriods);
+        emit ScheduleSet(_user, address(0), _rate, _interval, bytes32(0));
         _notifyListener(_user, true);
     }
 
@@ -317,7 +487,21 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (s.terminatedAt > 0) revert NoSchedule();
         if (_expiry(s) <= _today()) return; // already lapsed
 
-        s.terminatedAt = uint48(_today());
+        // Move dropoff for beneficiary schedules
+        if (s.to != address(0)) {
+            bytes32 sid = _scheduleId(s.to, s.rate, s.interval);
+            uint256 svcEnd = _serviceEnd(s);
+            uint256 svcEndEpoch = _epochOfDay(svcEnd, s.interval);
+            uint32 oldDropoff = _userDropoffEpoch[_user];
+
+            if (oldDropoff > 0) {
+                _dropoffs[sid][uint256(oldDropoff)]--;
+            }
+            _dropoffs[sid][svcEndEpoch + 1]++;
+            _userDropoffEpoch[_user] = uint32(svcEndEpoch + 1);
+        }
+
+        s.terminatedAt = uint32(_today());
         emit ScheduleTerminated(_user, s.terminatedAt);
     }
 
@@ -325,50 +509,17 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) revert NoSchedule();
 
+        if (s.to != address(0)) _removeUserFromBuckets(_user, s);
         _settleConsumed(s, _user);
 
         s.rate = 0;
+        s.to = address(0);
         s.interval = 0;
         s.anchor = 0;
         s.terminatedAt = 0;
-        s.cap = 0;
-        s.gracePeriods = 0;
 
         emit ScheduleCleared(_user);
         _notifyListener(_user, false);
-    }
-
-    function _addGracePeriods(address _user, uint16 _periods) internal {
-        Schedule storage s = _schedules[_user];
-        if (s.rate == 0) revert NoSchedule();
-        if (s.terminatedAt > 0) revert NoSchedule();
-        if (_expiry(s) <= _today()) revert NoSchedule();
-
-        // Settle consumed so far, restart anchor
-        _settleConsumed(s, _user);
-        s.anchor = uint48(_today());
-        s.gracePeriods = _periods;
-
-        emit GracePeriodsSet(_user, s.gracePeriods);
-        _notifyListener(_user, true);
-    }
-
-    function _setCap(address _user, uint16 _cap) internal {
-        Schedule storage s = _schedules[_user];
-        if (s.rate == 0) revert NoSchedule();
-        if (s.terminatedAt > 0) revert NoSchedule();
-        s.cap = _cap;
-    }
-
-    // ──────────────────────────────────────────────
-    // Public: Settle
-    // ──────────────────────────────────────────────
-
-    /// @notice Trigger lazy settlement for a user. Anyone can call.
-    function settle(
-        address _user
-    ) external {
-        _settle(_schedules[_user], _user);
     }
 
     // ──────────────────────────────────────────────
@@ -379,126 +530,141 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return block.timestamp / _SECONDS_PER_DAY;
     }
 
-    /// @dev Computed balance = principal - consumed. Just principal if no schedule.
-    function _balance(
-        Schedule storage _s
-    ) internal view returns (uint256) {
+    function _balance(Schedule storage _s) internal view returns (uint256) {
         if (_s.rate == 0) return uint256(_s.principal);
         uint256 c = _consumed(_s);
         return uint256(_s.principal) - c;
     }
 
-    /// @dev Billable periods = periods elapsed minus grace (floored at 0).
-    ///      Capped by funded periods, user cap, and _maxTotalPeriods.
-    function _consumed(
-        Schedule storage _s
-    ) internal view returns (uint256) {
+    /// @dev consumed = min(periodsElapsed, fundedPeriods) * rate.
+    ///      First payment at boundary (no +1). Immediate payment is separate.
+    function _consumed(Schedule storage _s) internal view returns (uint256) {
         if (_s.rate == 0) return 0;
 
         uint256 dayRef = _s.terminatedAt > 0 ? uint256(_s.terminatedAt) : _today();
+        if (dayRef <= uint256(_s.anchor)) return 0;
         uint256 elapsed = dayRef - uint256(_s.anchor);
-        uint256 started = (elapsed / uint256(_s.interval)) + 1;
-
-        uint256 grace = uint256(_s.gracePeriods);
-        uint256 billable = started > grace ? started - grace : 0;
+        uint256 periodsElapsed = elapsed / uint256(_s.interval);
 
         uint256 funded = uint256(_s.principal) / uint256(_s.rate);
-        uint256 capped = _capFunded(_s, funded);
-        uint256 effective = billable < capped ? billable : capped;
+        uint256 effective = periodsElapsed < funded ? periodsElapsed : funded;
         return effective * uint256(_s.rate);
     }
 
-    /// @dev Cap funded (billable) periods. _maxTotalPeriods is the global safety
-    ///      limit (protocol-level). cap is the per-user preference. Both apply to
-    ///      total periods (grace + funded).
-    function _capFunded(
-        Schedule storage _s,
-        uint256 _funded
-    ) internal view returns (uint256) {
-        uint256 c = _funded;
-        uint256 grace = uint256(_s.gracePeriods);
-        uint256 maxTotal = _maxTotalPeriods();
-
-        if (maxTotal > 0 && grace + c > maxTotal) {
-            c = maxTotal > grace ? maxTotal - grace : 0;
-        }
-
-        if (_s.cap > 0 && grace + c > uint256(_s.cap)) {
-            c = uint256(_s.cap) > grace ? uint256(_s.cap) - grace : 0;
-        }
-
-        return c;
-    }
-
-    /// @dev DayIndex when all periods (grace + funded) are exhausted.
-    function _expiry(
-        Schedule storage _s
-    ) internal view returns (uint256) {
+    function _expiry(Schedule storage _s) internal view returns (uint256) {
         uint256 funded = uint256(_s.principal) / uint256(_s.rate);
-        uint256 capped = _capFunded(_s, funded);
-        uint256 total = uint256(_s.gracePeriods) + capped;
-        return uint256(_s.anchor) + total * uint256(_s.interval);
+        return uint256(_s.anchor) + funded * uint256(_s.interval);
     }
 
-    /// @dev For terminated schedules, service ends at the current period boundary.
-    function _serviceEnd(
-        Schedule storage _s
-    ) internal view returns (uint256) {
+    function _serviceEnd(Schedule storage _s) internal view returns (uint256) {
         if (_s.terminatedAt > 0) {
             uint256 elapsed = uint256(_s.terminatedAt) - uint256(_s.anchor);
-            uint256 started = (elapsed / uint256(_s.interval)) + 1;
-            return uint256(_s.anchor) + started * uint256(_s.interval);
+            uint256 periodsElapsed = elapsed / uint256(_s.interval);
+            return uint256(_s.anchor) + (periodsElapsed + 1) * uint256(_s.interval);
         }
         return _expiry(_s);
+    }
+
+    // ──────────────────────────────────────────────
+    // Internal: Epoch helpers
+    // ──────────────────────────────────────────────
+
+    function _scheduleId(address _to, uint128 _rate, uint16 _interval) internal pure returns (bytes32) {
+        return keccak256(abi.encode(_to, _rate, _interval));
+    }
+
+    function _epochOf(uint16 _termDays) internal view returns (uint256) {
+        uint256 today = _today();
+        if (today <= uint256(DEPLOY_DAY)) return 0;
+        return (today - uint256(DEPLOY_DAY)) / uint256(_termDays);
+    }
+
+    function _epochOfDay(uint256 _day, uint16 _termDays) internal view returns (uint256) {
+        if (_day <= uint256(DEPLOY_DAY)) return 0;
+        return (_day - uint256(DEPLOY_DAY)) / uint256(_termDays);
     }
 
     // ──────────────────────────────────────────────
     // Internal: Settlement
     // ──────────────────────────────────────────────
 
-    /**
-     * @dev Deduct consumed from principal and emit events. Returns the amount
-     *      consumed. Does NOT clear or restart the schedule — callers handle that.
-     */
-    function _settleConsumed(
-        Schedule storage _s,
-        address _user
-    ) internal returns (uint256 c) {
+    function _settleConsumed(Schedule storage _s, address _user) internal returns (uint256 c) {
         c = _consumed(_s);
         if (c > 0) {
             _s.principal -= uint128(c);
-            totalSiphoned += c;
-            emit Transfer(_user, address(0), c);
-            emit Siphoned(_user, c);
+            if (_s.to == address(0)) {
+                totalBurned += c;
+                emit Transfer(_user, address(0), c);
+            } else {
+                emit Siphoned(_user, _s.to, c);
+            }
         }
     }
 
-    /**
-     * @dev Lazy cleanup. Only fires for ended schedules (lapsed or terminated+expired).
-     *      Deducts consumed, clears all schedule fields, notifies listener.
-     *      Safe to call on every interaction — no-op for active schedules.
-     */
-    function _settle(
-        Schedule storage _s,
-        address _user
-    ) internal {
+    /// @dev Lazy cleanup. Lapse or terminated+expired always clears the schedule.
+    function _settle(Schedule storage _s, address _user) internal {
         if (_s.rate == 0) return;
 
         bool lapsed = _expiry(_s) <= _today();
         bool expired = _s.terminatedAt > 0 && _serviceEnd(_s) <= _today();
+
         if (!lapsed && !expired) return;
 
         uint256 c = _settleConsumed(_s, _user);
 
+        // Always clear — no autorenew
         _s.rate = 0;
+        _s.to = address(0);
         _s.interval = 0;
         _s.anchor = 0;
         _s.terminatedAt = 0;
-        _s.cap = 0;
-        _s.gracePeriods = 0;
 
         emit ScheduleSettled(_user, c);
         _notifyListener(_user, false);
+    }
+
+    // ──────────────────────────────────────────────
+    // Internal: Bucket Management
+    // ──────────────────────────────────────────────
+
+    /// @dev Update a user's dropoff after their principal changed (mint/spend/transfer).
+    function _updateDropoff(address _user, Schedule storage _s) internal {
+        bytes32 sid = _scheduleId(_s.to, _s.rate, _s.interval);
+        uint32 oldDropoff = _userDropoffEpoch[_user];
+        uint256 currentEpoch = _epochOf(_s.interval);
+
+        uint256 fundedTerms = uint256(_s.principal) / uint256(_s.rate);
+        uint256 newDropoff = currentEpoch + 1 + fundedTerms;
+
+        if (uint256(oldDropoff) != newDropoff) {
+            if (oldDropoff > 0) {
+                _dropoffs[sid][uint256(oldDropoff)]--;
+            }
+            _dropoffs[sid][newDropoff]++;
+            _userDropoffEpoch[_user] = uint32(newDropoff);
+        }
+    }
+
+    /// @dev Remove a user from the bucket system entirely.
+    function _removeUserFromBuckets(address _user, Schedule storage _s) internal {
+        bytes32 sid = _scheduleId(_s.to, _s.rate, _s.interval);
+        Checkpoint storage cp = _checkpoints[sid];
+
+        // Remove joinoff if it hasn't been collected yet
+        uint256 joinEpoch = _epochOfDay(uint256(_s.anchor), _s.interval) + 1;
+        if (joinEpoch > uint256(cp.lastEpoch)) {
+            uint256 j = _joinoffs[sid][joinEpoch];
+            if (j > 0) _joinoffs[sid][joinEpoch] = j - 1;
+        }
+
+        // Remove dropoff if it hasn't been collected yet
+        uint32 dropoffEpoch = _userDropoffEpoch[_user];
+        if (dropoffEpoch > 0 && uint256(dropoffEpoch) > uint256(cp.lastEpoch)) {
+            uint256 d = _dropoffs[sid][uint256(dropoffEpoch)];
+            if (d > 0) _dropoffs[sid][uint256(dropoffEpoch)] = d - 1;
+        }
+
+        _userDropoffEpoch[_user] = 0;
     }
 
     // ──────────────────────────────────────────────
