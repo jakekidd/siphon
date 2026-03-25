@@ -32,14 +32,14 @@ contract SimpleSiphon is SiphonToken {
 
     function mint(address _user, uint128 _amount) external onlyOwner { _mint(_user, _amount); }
 
-    /// @notice Scheduler assigns a beneficiary schedule to a user (consumes schedule approval).
+    /// @notice Scheduler assigns a beneficiary schedule (beneficiary = _to).
     function assignSchedule(
         address _user, address _to, uint128 _rate, uint16 _interval
     ) external onlyScheduler {
         _assign(_user, _to, _rate, _interval);
     }
 
-    /// @notice Scheduler sets a burn-path schedule (no beneficiary, no buckets).
+    /// @notice Scheduler sets a burn-path schedule.
     function setSchedule(
         address _user, uint128 _rate, uint16 _interval
     ) external onlyScheduler {

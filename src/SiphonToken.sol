@@ -25,15 +25,17 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  *     to != address(0): consumed tokens flow to a beneficiary via shared
  *     count buckets (joinoffs + dropoffs). The beneficiary calls collect().
  *
+ *   SCHEDULES
+ *     Beneficiaries list schedules: scheduleId = keccak256(beneficiary, rate,
+ *     termDays). Stored in a ScheduleConfig. The beneficiary IS the scheduler —
+ *     they call assign() to activate a schedule for a user. Users pre-approve
+ *     via approveSchedule(). There is no separate "to" parameter; the
+ *     beneficiary is always the schedule's creator.
+ *
  *   SCHEDULE APPROVAL
  *     Users pre-approve schedules by ID: approveSchedule(scheduleId, count).
- *     Each assignment consumes one approval. type(uint256).max = infinite
+ *     Each assign() consumes one approval. type(uint256).max = infinite
  *     (beneficiary can reassign freely, e.g. auto-renew after lapse).
- *     Lapse or termination does NOT revoke remaining approvals.
- *
- *   SHARED COUNT BUCKETS
- *     scheduleId = keccak256(beneficiary, rate, termDays). All subscribers
- *     share count buckets. O(1) per user mutation, O(epochs) collect.
  *
  *   ONLY FULLY FUNDED PERIODS
  *     consumed = min(periodsElapsed, fundedPeriods) * rate, where
@@ -44,7 +46,7 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  *
  *   LAPSE = DONE
  *     Lapse always clears the schedule. To resume, the user must re-approve
- *     and the beneficiary must re-assign. No auto-resume on deposit.
+ *     and the beneficiary must re-assign.
  *
  *   SCHEDULE STRUCT — TWO STORAGE SLOTS
  *     Slot 1: { uint128 principal, uint128 rate }
@@ -74,14 +76,15 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     event ScheduleSet(
-        address indexed user, address indexed to, uint128 rate,
-        uint16 interval, bytes32 scheduleId
+        address indexed user, bytes32 indexed scheduleId,
+        address beneficiary, uint128 rate, uint16 interval
     );
     event ScheduleTerminated(address indexed user, uint32 terminatedAt);
     event ScheduleCleared(address indexed user);
     event ScheduleSettled(address indexed user, uint256 amount);
     event ScheduleApproval(address indexed user, bytes32 indexed scheduleId, uint256 count);
     event ScheduleComped(address indexed user, bytes32 indexed scheduleId, uint8 periods);
+    event ScheduleListed(bytes32 indexed scheduleId, address indexed beneficiary, uint128 rate, uint16 termDays);
     event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
     event Collected(address indexed beneficiary, bytes32 indexed scheduleId, uint256 amount, uint256 epochs);
@@ -96,6 +99,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
      *   Slot 1 (256 bits): principal (128) + rate (128)
      *   Slot 2 (256 bits): to (160) + interval (16) + anchor (32)
      *                      + terminatedAt (32) = 240  [16 bits free]
+     *   `to` is set automatically from the ScheduleConfig on assign.
      */
     struct Schedule {
         uint128 principal;
@@ -104,6 +108,14 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint16 interval;
         uint32 anchor;
         uint32 terminatedAt;
+    }
+
+    /// @dev Shared schedule definition. Created by beneficiary via list() or lazily on first assign.
+    ///      scheduleId = keccak256(abi.encode(beneficiary, rate, termDays)).
+    struct ScheduleConfig {
+        address beneficiary;
+        uint16 termDays;
+        uint128 rate;
     }
 
     /// @dev Collection checkpoint per scheduleId. Packed in one slot.
@@ -135,6 +147,9 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     uint256 public totalMinted;
     uint256 public totalBurned;
     uint256 public totalSpent;
+
+    /// @dev Schedule configs by ID.
+    mapping(bytes32 => ScheduleConfig) internal _configs;
 
     /// @dev Schedule approval counts. user => scheduleId => remaining approvals.
     ///      type(uint256).max = infinite (beneficiary can reassign freely).
@@ -269,8 +284,13 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return _today();
     }
 
-    function scheduleId(address _to, uint128 _rate, uint16 _interval) external pure returns (bytes32) {
-        return _scheduleId(_to, _rate, _interval);
+    function scheduleId(address _beneficiary, uint128 _rate, uint16 _interval) external pure returns (bytes32) {
+        return _scheduleId(_beneficiary, _rate, _interval);
+    }
+
+    function getConfig(bytes32 _sid) external view returns (address beneficiary, uint16 termDays, uint128 rate) {
+        ScheduleConfig storage c = _configs[_sid];
+        return (c.beneficiary, c.termDays, c.rate);
     }
 
     function getCheckpoint(bytes32 _sid) external view returns (uint32 lastEpoch, uint224 count) {
@@ -290,10 +310,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Terminate
     // ──────────────────────────────────────────────
 
-    /// @notice Terminate a user's schedule. Callable by the user or the beneficiary.
-    ///         The schedule stays active through the current paid period, then clears
-    ///         on next settle. Like revoking an autopay at the bank — service continues
-    ///         until the paid period runs out.
+    /// @notice Terminate a user's schedule. Callable by the user or the schedule's
+    ///         beneficiary. Service continues through the current paid period.
     function terminate(address _user) external virtual {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) revert NoSchedule();
@@ -302,25 +320,24 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     // ──────────────────────────────────────────────
-    // Public: Assign (beneficiary sets schedule for user)
+    // Public: Assign (beneficiary activates schedule for user)
     // ──────────────────────────────────────────────
 
-    /// @notice Assign a schedule to a user. Consumes one schedule approval.
-    ///         Anyone can call — the user's prior approveSchedule() is the gate.
-    ///         Immediate first-term payment is transferred directly to beneficiary.
+    /// @notice Assign a schedule to a user. msg.sender IS the beneficiary.
+    ///         Consumes one schedule approval. Immediate first-term payment
+    ///         is transferred directly to msg.sender (the beneficiary).
     function assign(
         address _user,
-        address _to,
         uint128 _rate,
         uint16 _interval
     ) external virtual {
-        bytes32 sid = _scheduleId(_to, _rate, _interval);
+        bytes32 sid = _scheduleId(msg.sender, _rate, _interval);
         uint256 approvals = _scheduleApprovals[_user][sid];
         if (approvals == 0) revert NotApproved();
         if (approvals != type(uint256).max) {
             _scheduleApprovals[_user][sid] = approvals - 1;
         }
-        _assign(_user, _to, _rate, _interval);
+        _assign(_user, msg.sender, _rate, _interval);
     }
 
     // ──────────────────────────────────────────────
@@ -328,17 +345,13 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /// @notice Collect accumulated income for a schedule. Anyone can call;
-    ///         tokens always go to the beneficiary encoded in the scheduleId.
-    ///         Caller provides schedule params; contract verifies hash.
-    function collect(
-        address _to,
-        uint128 _rate,
-        uint16 _interval,
-        uint256 _maxEpochs
-    ) external {
-        bytes32 sid = _scheduleId(_to, _rate, _interval);
-        Checkpoint storage cp = _checkpoints[sid];
-        uint256 current = _epochOf(_interval);
+    ///         tokens always go to the schedule's beneficiary.
+    function collect(bytes32 _sid, uint256 _maxEpochs) external {
+        ScheduleConfig storage cfg = _configs[_sid];
+        if (cfg.beneficiary == address(0)) revert InvalidSchedule();
+
+        Checkpoint storage cp = _checkpoints[_sid];
+        uint256 current = _epochOf(cfg.termDays);
         uint256 last = uint256(cp.lastEpoch);
         uint256 end = last + _maxEpochs;
         if (end > current) end = current;
@@ -348,22 +361,22 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint256 total;
 
         for (uint256 e = last + 1; e <= end; e++) {
-            running += _joinoffs[sid][e];
-            uint256 drops = _dropoffs[sid][e];
+            running += _joinoffs[_sid][e];
+            uint256 drops = _dropoffs[_sid][e];
             if (drops > running) drops = running;
             running -= drops;
-            delete _joinoffs[sid][e];
-            delete _dropoffs[sid][e];
-            total += running * uint256(_rate);
+            delete _joinoffs[_sid][e];
+            delete _dropoffs[_sid][e];
+            total += running * uint256(cfg.rate);
         }
 
         cp.lastEpoch = uint32(end);
         cp.count = uint224(running);
 
         if (total > 0) {
-            _schedules[_to].principal += uint128(total);
-            emit Transfer(address(this), _to, total);
-            emit Collected(_to, sid, total, end - last);
+            _schedules[cfg.beneficiary].principal += uint128(total);
+            emit Transfer(address(this), cfg.beneficiary, total);
+            emit Collected(cfg.beneficiary, _sid, total, end - last);
         }
     }
 
@@ -424,6 +437,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     /// @dev Assign a beneficiary schedule with immediate first-term payment.
+    ///      `_to` is always the beneficiary from the ScheduleConfig.
     function _assign(
         address _user,
         address _to,
@@ -449,15 +463,21 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         _schedules[_to].principal += _rate;
         emit Transfer(_user, _to, _rate);
 
-        // Set schedule
+        // Set schedule (to is set from the schedule's beneficiary, not user-controlled)
         s.rate = _rate;
         s.to = _to;
         s.interval = _interval;
         s.anchor = uint32(_today());
         s.terminatedAt = 0;
 
-        // Bucket accounting: joinoff at next epoch (immediate payment covers current)
+        // Ensure config exists
         bytes32 sid = _scheduleId(_to, _rate, _interval);
+        if (_configs[sid].beneficiary == address(0)) {
+            _configs[sid] = ScheduleConfig(_to, _interval, _rate);
+            emit ScheduleListed(sid, _to, _rate, _interval);
+        }
+
+        // Bucket accounting: joinoff at next epoch (immediate payment covers current)
         uint256 currentEpoch = _epochOf(_interval);
         uint256 joinEpoch = currentEpoch + 1;
         _joinoffs[sid][joinEpoch]++;
@@ -467,7 +487,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         _dropoffs[sid][dropoffEpoch]++;
         _userDropoffEpoch[_user] = uint32(dropoffEpoch);
 
-        emit ScheduleSet(_user, _to, _rate, _interval, sid);
+        emit ScheduleSet(_user, sid, _to, _rate, _interval);
         _notifyListener(_user, true);
     }
 
@@ -494,7 +514,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         s.anchor = uint32(_today());
         s.terminatedAt = 0;
 
-        emit ScheduleSet(_user, address(0), _rate, _interval, bytes32(0));
+        emit ScheduleSet(_user, bytes32(0), address(0), _rate, _interval);
         _notifyListener(_user, true);
     }
 
@@ -522,10 +542,26 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit ScheduleTerminated(_user, s.terminatedAt);
     }
 
+    function _clearSchedule(address _user) internal {
+        Schedule storage s = _schedules[_user];
+        if (s.rate == 0) revert NoSchedule();
+
+        if (s.to != address(0)) _removeUserFromBuckets(_user, s);
+        _settleConsumed(s, _user);
+
+        s.rate = 0;
+        s.to = address(0);
+        s.interval = 0;
+        s.anchor = 0;
+        s.terminatedAt = 0;
+
+        emit ScheduleCleared(_user);
+        _notifyListener(_user, false);
+    }
+
     /// @dev Beneficiary comps N periods for a user. Settles consumed, moves anchor
     ///      forward by N intervals, writes dropoff (user pauses paying) and joinoff
-    ///      (user resumes after N free periods). Existing dropoff stays for when
-    ///      funds run out. Only for beneficiary schedules.
+    ///      (user resumes after N free periods). Only for beneficiary schedules.
     function _comp(address _user, uint8 _periods) internal {
         Schedule storage s = _schedules[_user];
         if (s.rate == 0) revert NoSchedule();
@@ -557,23 +593,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         _userDropoffEpoch[_user] = uint32(newDropoff);
 
         emit ScheduleComped(_user, sid, _periods);
-    }
-
-    function _clearSchedule(address _user) internal {
-        Schedule storage s = _schedules[_user];
-        if (s.rate == 0) revert NoSchedule();
-
-        if (s.to != address(0)) _removeUserFromBuckets(_user, s);
-        _settleConsumed(s, _user);
-
-        s.rate = 0;
-        s.to = address(0);
-        s.interval = 0;
-        s.anchor = 0;
-        s.terminatedAt = 0;
-
-        emit ScheduleCleared(_user);
-        _notifyListener(_user, false);
     }
 
     // ──────────────────────────────────────────────
@@ -623,8 +642,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Epoch helpers
     // ──────────────────────────────────────────────
 
-    function _scheduleId(address _to, uint128 _rate, uint16 _interval) internal pure returns (bytes32) {
-        return keccak256(abi.encode(_to, _rate, _interval));
+    function _scheduleId(address _beneficiary, uint128 _rate, uint16 _interval) internal pure returns (bytes32) {
+        return keccak256(abi.encode(_beneficiary, _rate, _interval));
     }
 
     function _epochOf(uint16 _termDays) internal view returns (uint256) {
@@ -666,7 +685,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         uint256 c = _settleConsumed(_s, _user);
 
-        // Always clear — no autorenew
+        // Always clear
         _s.rate = 0;
         _s.to = address(0);
         _s.interval = 0;
