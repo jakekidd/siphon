@@ -175,7 +175,7 @@ token.currentEpoch()
 
 **Rent** (`src/example/RentalAgreement.sol`). One landlord, many tenants, same rent rate. All tenants share the same mandateId (same beneficiary contract + same rate = same hash), so one `harvest()` call collects everyone's rent. Includes security deposit handling, lease terms, delinquency detection, and tenant self-move-out.
 
-**Timeshare** (`src/example/Timeshare.sol`). Rotating payment responsibility among multiple users. Currently a design stub (constructor reverts); the naive manual-rotation approach needs a shared pool contract to properly handle asymmetric cost splitting and automated rotation. See the contract comments for the design options.
+**Timeshare** (`src/example/Timeshare.sol` + `TimeshareEscrow.sol`). Rotating payment responsibility among multiple users. Two-contract architecture: Timeshare (manager/beneficiary) deploys a TimeshareEscrow per agreement. Members deposit their share into the escrow each season; the escrow gets tapped and its balance drains at rate-per-term. Round-robin access rotation, seasonal renewal with automatic leftover refunds, comp (property maintenance), and funding reclaim with deadlines. Shows the "many payers, one pool, one beneficiary" pattern.
 
 **Protocol burns.** A token where holding costs something. Burn mandates (`beneficiary = address(0)`) drain the balance into the void, reducing total supply. No beneficiary to harvest; the tokens just disappear. Use `_tap(user, address(0), rate)` internally.
 
@@ -194,7 +194,7 @@ forge build
 forge test -vvv
 ```
 
-132 tests covering core mechanics, example contracts, edge cases, and fuzz.
+167 tests covering core mechanics, example contracts, edge cases, and fuzz.
 
 ## License
 
