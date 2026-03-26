@@ -604,9 +604,16 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     /// @dev Priority resolution: first-tapped survives, later taps lapse.
     ///      Bucket entries/exits are left in place for lapsed taps so
     ///      beneficiaries can still harvest their earned income.
+    ///
+    ///      Principal is NOT modified here. Surviving taps consume from
+    ///      principal via normal settlement in subsequent periods. Only
+    ///      outflow is adjusted (lapsing taps removed). Exits are recomputed
+    ///      so the new funded count (principal / reduced outflow) is reflected
+    ///      in the bucket system.
     function _resolvePriority(address _user) internal {
         Account storage a = _accounts[_user];
-        uint256 remaining = uint256(a.principal);
+        uint256 budget = uint256(a.principal);
+        uint256 committed;
         bytes32[] storage taps = _userTaps[_user];
 
         uint256 i = 0;
@@ -614,8 +621,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
             bytes32 mid = taps[i];
             Tap storage t = _taps[_user][mid];
 
-            if (remaining >= uint256(t.rate)) {
-                remaining -= uint256(t.rate);
+            if (committed + uint256(t.rate) <= budget) {
+                committed += uint256(t.rate);
                 i++;
             } else {
                 // Lapse — clean up tap but preserve bucket entries/exits
@@ -634,7 +641,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
             }
         }
 
-        a.principal = uint128(remaining);
+        // Recompute exits for surviving taps (outflow changed → funded changed)
+        _recomputeAllExits(_user);
 
         if (taps.length == 0) {
             _notifyListener(_user, false);

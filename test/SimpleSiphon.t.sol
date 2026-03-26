@@ -446,8 +446,8 @@ contract SimpleSiphonTest is Test {
     function test_SiphonToken__settle_resolvePriorityOnLapse() public {
         // 3 taps at RATE each: immediate = 3*RATE. principal = 2*RATE. outflow = 3*RATE. funded = 0.
         // After 30 days: elapsed=1 > funded=0 => lapse.
-        // Priority: remaining=2*RATE. tap1 survives (remaining-=RATE). tap2 survives (remaining=0).
-        //           tap3: 0 < RATE => lapsed.
+        // Priority: budget=2*RATE. tap1 survives (2*RATE >= RATE). tap2 survives (2*RATE >= 2*RATE).
+        //           tap3: 2*RATE < 3*RATE => lapsed.
 
         _mint(alice, RATE * 5);
         _tapViaSched(alice, treasury, RATE);   // first-tapped
@@ -459,7 +459,8 @@ contract SimpleSiphonTest is Test {
         token.settle(alice);
 
         // settle: funded=0, con=0. elapsed(1) > funded(0) => _resolvePriority.
-        // remaining=2*RATE. tap1 survives (-RATE). tap2 survives (-RATE). tap3 lapses (0 < RATE).
+        // Principal preserved (no leak). tap3 lapsed. outflow reduced to 2*RATE.
+        // funded = 2*RATE / 2*RATE = 1. Surviving taps get 1 funded period.
 
         bytes32[] memory taps = token.getUserTaps(alice);
         assertEq(taps.length, 2, "two taps should survive");
@@ -467,7 +468,7 @@ contract SimpleSiphonTest is Test {
         assertEq(taps[1], _mid(bob, RATE));
 
         (uint128 principal, uint128 outflow,) = token.getAccount(alice);
-        assertEq(principal, 0);
+        assertEq(principal, RATE * 2); // preserved, not drained
         assertEq(outflow, RATE * 2);
     }
 
