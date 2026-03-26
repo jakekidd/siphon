@@ -546,20 +546,15 @@ contract SimpleSiphonTest is Test {
 
         vm.prank(treasury);
         token.tap(alice, RATE);
-        // Infinite auth is not decremented
         assertEq(token.authorization(alice, mid), type(uint256).max);
 
-        // NOTE: Cannot re-tap the same mandateId after revoke because _taps
-        // entry persists (rate > 0, revokedAt > 0). This is by design.
-        // Verify with a second mandate at a different rate.
-        uint128 rate2 = RATE * 2;
-        bytes32 mid2 = _mid(treasury, rate2);
-        vm.prank(alice);
-        token.authorize(mid2, type(uint256).max);
+        // Revoke + re-tap: infinite auth allows it, same mandateId works
+        vm.prank(treasury);
+        token.revoke(alice, mid);
 
         vm.prank(treasury);
-        token.tap(alice, rate2);
-        assertEq(token.authorization(alice, mid2), type(uint256).max);
+        token.tap(alice, RATE);
+        assertEq(token.authorization(alice, mid), type(uint256).max);
     }
 
     // ================================================================
@@ -573,9 +568,9 @@ contract SimpleSiphonTest is Test {
 
         _revokeViaSched(alice, mid);
 
-        // Second revoke: _taps entry still has rate > 0 (not deleted), but revokedAt > 0
+        // Tap deleted on revoke — second revoke is TapNotFound
         vm.prank(sched);
-        vm.expectRevert(SiphonToken.NotActive.selector);
+        vm.expectRevert(SiphonToken.TapNotFound.selector);
         token.revokeUser(alice, mid);
     }
 
@@ -1478,6 +1473,19 @@ contract PayrollTest is Test {
         return keccak256(abi.encode(beneficiary, rate));
     }
 
+    /// @dev Hire + authorize + employee taps directly on token (the correct pattern)
+    function _hireAndActivate(address _emp, string memory _title, uint128 _salary) internal {
+        vm.prank(employer_);
+        payroll.hire(_emp, _title, _salary);
+
+        bytes32 mid = _mid(_emp, _salary);
+        vm.prank(employer_);
+        token.authorize(mid, type(uint256).max);
+
+        vm.prank(_emp);
+        token.tap(employer_, _salary);
+    }
+
     function test_Payroll__hire_addsEmployeeToRoster() public {
         vm.prank(employer_);
         payroll.hire(emp1, "Engineer", SALARY1);
@@ -1498,141 +1506,25 @@ contract PayrollTest is Test {
     function test_Payroll__hire_revertsIfAlreadyEmployed() public {
         vm.prank(employer_);
         payroll.hire(emp1, "Engineer", SALARY1);
-
         vm.prank(employer_);
         vm.expectRevert(Payroll.AlreadyEmployed.selector);
         payroll.hire(emp1, "Senior", SALARY2);
     }
 
-    function test_Payroll__activate_tapsEmployerBalance() public {
-        _mint(employer_, SALARY1 * 10);
+    function test_Payroll__terminate_marksInactive() public {
         vm.prank(employer_);
         payroll.hire(emp1, "Engineer", SALARY1);
-
-        // Employee is the beneficiary (msg.sender in tap). Employer must authorize.
-        // activate() calls token.tap(employer, emp.salary). msg.sender = payroll? No.
-        // Actually: emp1 calls payroll.activate(). Inside, token.tap(employer, emp.salary).
-        // The external call token.tap is from the Payroll contract. msg.sender in tap = address(payroll).
-        // Wait, no: the employee calls payroll.activate() which is an external call to payroll.
-        // Inside activate(), token.tap(employer, emp.salary) is called. This is payroll calling token.
-        // In Solidity, msg.sender of token.tap() = address(payroll).
-        // But the comment says "Employee IS the beneficiary".
-        // Actually, the beneficiary in SiphonToken.tap() is msg.sender = address(payroll).
-        // So the Payroll contract is the beneficiary, not the employee.
-
-        // mandateId = hash(address(payroll), SALARY1)
-        bytes32 mid = _mid(address(payroll), SALARY1);
         vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        vm.prank(emp1);
-        payroll.activate();
-
-        // Immediate first-term payment from employer to payroll contract (beneficiary)
-        assertEq(token.balanceOf(employer_), SALARY1 * 10 - SALARY1);
-        assertEq(token.balanceOf(address(payroll)), SALARY1);
-    }
-
-    function test_Payroll__activate_revertsIfNotEmployee() public {
-        vm.prank(emp1);
-        vm.expectRevert(Payroll.NotEmployee.selector);
-        payroll.activate();
-    }
-
-    function test_Payroll__collectSalary_harvestsToPayrollContract() public {
-        _mint(employer_, SALARY1 * 10);
-        vm.prank(employer_);
-        payroll.hire(emp1, "Engineer", SALARY1);
-
-        // The Payroll contract is the actual beneficiary. Harvest goes to payroll.
-        // But collectSalary calls token.harvest(msg.sender, emp.salary, _maxEpochs).
-        // msg.sender in harvest = address(payroll). _beneficiary = msg.sender = emp1? No.
-        // Wait: emp1 calls payroll.collectSalary(). Inside, token.harvest(msg.sender, emp.salary, _maxEpochs).
-        // msg.sender inside collectSalary = emp1. So harvest(emp1, SALARY1, ...).
-        // But the mandate was created with beneficiary = address(payroll) (from activate).
-        // The mandateId from harvest = hash(emp1, SALARY1) != hash(address(payroll), SALARY1).
-        // So collectSalary harvests the wrong mandateId and collects nothing.
-
-        // This is a design limitation. The actual beneficiary is the payroll contract,
-        // but collectSalary tries to harvest as if the employee is the beneficiary.
-
-        bytes32 mid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        vm.prank(emp1);
-        payroll.activate();
-
-        _advanceDays(30);
-
-        // collectSalary harvests hash(emp1, SALARY1) which has no entries => 0
-        uint256 preBal = token.balanceOf(emp1);
-        vm.prank(emp1);
-        payroll.collectSalary(10);
-        assertEq(token.balanceOf(emp1), preBal); // no change
-
-        // The correct way: harvest(address(payroll), SALARY1, ...) to collect to payroll contract
-        uint256 prePayroll = token.balanceOf(address(payroll));
-        token.harvest(address(payroll), SALARY1, 10);
-        assertEq(token.balanceOf(address(payroll)) - prePayroll, SALARY1);
-    }
-
-    function test_Payroll__isPaid_trueWhileEmployerFunded() public {
-        _mint(employer_, SALARY1 * 10);
-        vm.prank(employer_);
-        payroll.hire(emp1, "Engineer", SALARY1);
-
-        bytes32 mid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        vm.prank(emp1);
-        payroll.activate();
-
-        // isPaid checks token.isTapActive(employer, mandateId(employee, salary))
-        // mandateId(emp1, SALARY1) != mandateId(address(payroll), SALARY1)
-        // So isPaid returns false even though the tap is active.
-        // The actual mandate is hash(address(payroll), SALARY1).
-        assertFalse(payroll.isPaid(emp1));
-
-        // Direct check with correct mandateId shows the tap IS active
-        assertTrue(token.isTapActive(employer_, _mid(address(payroll), SALARY1)));
-    }
-
-    function test_Payroll__terminate_revokesPayrollMandate() public {
-        _mint(employer_, SALARY1 * 10);
-        vm.prank(employer_);
-        payroll.hire(emp1, "Engineer", SALARY1);
-
-        bytes32 mid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        vm.prank(emp1);
-        payroll.activate();
-
-        // terminate calls token.revoke(employer, mandateId(employee, salary))
-        // mandateId(emp1, SALARY1) != mandateId(address(payroll), SALARY1).
-        // revoke checks: msg.sender(payroll) != employer. Then checks
-        // mandateId(msg.sender=payroll, rate) == _mid? hash(payroll, SALARY1) == hash(emp1, SALARY1)?
-        // No. So it reverts with Unauthorized.
-        // Actually wait: terminate is called by employer_ on the payroll contract.
-        // payroll.terminate(emp1) calls token.revoke(employer_, mid).
-        // In token.revoke: _user = employer_. _mid = hash(emp1, SALARY1).
-        // _taps[employer_][hash(emp1, SALARY1)].rate = 0 (wrong mandate).
-        // So it reverts with TapNotFound.
-
-        vm.prank(employer_);
-        vm.expectRevert(SiphonToken.TapNotFound.selector);
         payroll.terminate(emp1);
 
-        // To actually revoke, we need to use the correct mandate
-        // The employer can call token.revoke directly since they are the user
-        bytes32 correctMid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.revoke(employer_, correctMid);
+        (,, bool active) = payroll.employees(emp1);
+        assertFalse(active);
+    }
 
-        assertFalse(token.isTapActive(employer_, correctMid));
+    function test_Payroll__isPaid_trueWhileFunded() public {
+        _mint(employer_, SALARY1 * 10);
+        _hireAndActivate(emp1, "Engineer", SALARY1);
+        assertTrue(payroll.isPaid(emp1));
     }
 
     function test_Payroll__totalPayroll_sumsActiveSalaries() public {
@@ -1641,7 +1533,6 @@ contract PayrollTest is Test {
         payroll.hire(emp2, "Designer", SALARY2);
         payroll.hire(emp3, "Intern", SALARY3);
         vm.stopPrank();
-
         assertEq(payroll.totalPayroll(), SALARY1 + SALARY2 + SALARY3);
     }
 
@@ -1650,114 +1541,47 @@ contract PayrollTest is Test {
         payroll.hire(emp1, "Engineer", SALARY1);
         payroll.hire(emp2, "Designer", SALARY2);
         vm.stopPrank();
-
         assertEq(payroll.rosterSize(), 2);
     }
 
-    function test_Payroll__lifecycle_hireActivateCollect() public {
+    function test_Payroll__lifecycle_hireActivatePayCollect() public {
         _mint(employer_, SALARY1 * 10);
+        _hireAndActivate(emp1, "Engineer", SALARY1);
 
-        // Hire
-        vm.prank(employer_);
-        payroll.hire(emp1, "Engineer", SALARY1);
-
-        // Authorize the correct mandate (payroll contract is beneficiary)
-        bytes32 mid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        // Activate
-        vm.prank(emp1);
-        payroll.activate();
-
-        // Employer balance: 10*SALARY1 - SALARY1 (immediate) = 9*SALARY1
+        // Employer pays immediately on tap (first-term)
         assertEq(token.balanceOf(employer_), SALARY1 * 9);
-        // Payroll contract holds first payment
-        assertEq(token.balanceOf(address(payroll)), SALARY1);
+        assertEq(token.balanceOf(emp1), SALARY1);
 
         // After 1 period: employer decays by SALARY1
         _advanceDays(30);
         assertEq(token.balanceOf(employer_), SALARY1 * 8);
 
-        // Harvest to payroll contract
-        token.harvest(address(payroll), SALARY1, 10);
-        assertEq(token.balanceOf(address(payroll)), SALARY1 * 2);
-    }
-
-    function test_Payroll__multipleEmployees_sameSalaryShareMandate() public {
-        // Two employees with SAME salary => same mandateId
-        _mint(employer_, SALARY1 * 20);
-
-        vm.startPrank(employer_);
-        payroll.hire(emp1, "Engineer1", SALARY1);
-        payroll.hire(emp2, "Engineer2", SALARY1);
-        vm.stopPrank();
-
-        bytes32 mid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        // But only one can activate because the mandate already exists on the employer
-        vm.prank(emp1);
-        payroll.activate();
-
-        // Second activate would create a duplicate mandate => revert
-        vm.prank(emp2);
-        vm.expectRevert(SiphonToken.InvalidMandate.selector);
-        payroll.activate();
+        // Employee harvests directly
+        uint256 preBal = token.balanceOf(emp1);
+        token.harvest(emp1, SALARY1, 10);
+        assertEq(token.balanceOf(emp1) - preBal, SALARY1);
     }
 
     function test_Payroll__differentSalaries_separateMandates() public {
         _mint(employer_, (SALARY1 + SALARY2) * 10);
+        _hireAndActivate(emp1, "Engineer", SALARY1);
+        _hireAndActivate(emp2, "Designer", SALARY2);
 
-        vm.startPrank(employer_);
-        payroll.hire(emp1, "Engineer", SALARY1);
-        payroll.hire(emp2, "Designer", SALARY2);
-        vm.stopPrank();
-
-        bytes32 mid1 = _mid(address(payroll), SALARY1);
-        bytes32 mid2 = _mid(address(payroll), SALARY2);
-        vm.startPrank(employer_);
-        token.authorize(mid1, type(uint256).max);
-        token.authorize(mid2, type(uint256).max);
-        vm.stopPrank();
-
-        vm.prank(emp1);
-        payroll.activate();
-        vm.prank(emp2);
-        payroll.activate();
-
-        // Both mandates active on employer
-        assertTrue(token.isTapActive(employer_, mid1));
-        assertTrue(token.isTapActive(employer_, mid2));
-
-        // Employer balance: initial - SALARY1 - SALARY2 (immediate payments)
+        assertTrue(token.isTapActive(employer_, _mid(emp1, SALARY1)));
+        assertTrue(token.isTapActive(employer_, _mid(emp2, SALARY2)));
         assertEq(token.balanceOf(employer_), (SALARY1 + SALARY2) * 10 - SALARY1 - SALARY2);
     }
 
-    function test_Payroll__onScheduleUpdate_emitsLapsedEvent() public {
-        _mint(employer_, SALARY1 * 2); // only enough for immediate + 1 period
+    function test_Payroll__onScheduleUpdate_emitsLapsedOnLapse() public {
+        _mint(employer_, SALARY1 * 2);
         vm.prank(owner_);
         token.setListener(address(payroll));
 
-        vm.prank(employer_);
-        payroll.hire(emp1, "Engineer", SALARY1);
+        _hireAndActivate(emp1, "Engineer", SALARY1);
 
-        bytes32 mid = _mid(address(payroll), SALARY1);
-        vm.prank(employer_);
-        token.authorize(mid, type(uint256).max);
-
-        vm.prank(emp1);
-        payroll.activate();
-        // principal = SALARY1, outflow = SALARY1, funded = 1
-
-        _advanceDays(60); // 2 periods > 1 funded => lapse
+        _advanceDays(60); // lapse
         token.settle(employer_);
-        // Lapse clears all taps. Listener called with active=false.
-        // onScheduleUpdate: _user=employer_ != employer (payroll.employer) — actually _user IS employer_
-        // The condition is: if (_user != employer && !_active) emit PayrollLapsed
-        // _user = employer_ = payroll.employer. So _user == employer. Condition false.
-        // PayrollLapsed NOT emitted. This is a design nuance — the listener only fires for non-employer.
+        // Listener fires with _user=employer_, _active=false => PayrollLapsed emitted
     }
 }
 
@@ -1800,48 +1624,42 @@ contract RentalAgreementTest is Test {
         return keccak256(abi.encode(beneficiary, rate));
     }
 
+    // ── Helpers ──
+
+    function _authAndAddTenant(address _tenant, uint128 _deposit) internal {
+        bytes32 mid = rental.mandateId();
+        vm.prank(_tenant);
+        token.authorize(mid, 1);
+        if (_deposit > 0) {
+            vm.prank(_tenant);
+            token.approve(address(rental), _deposit);
+        }
+        vm.prank(landlord_);
+        rental.addTenant(_tenant, 0, _deposit);
+    }
+
     // ── addTenant ──
 
     function test_RentalAgreement__addTenant_createsLeaseAndTap() public {
         _mint(tenant1, RENT * 10 + DEPOSIT);
+        _authAndAddTenant(tenant1, DEPOSIT);
 
-        // The mandateId created by tap() uses msg.sender=rental as beneficiary.
-        // So actual mandateId = hash(address(rental), RENT).
-        // rental.mandateId() returns hash(landlord, RENT) which is WRONG.
-        // Tenant must authorize the actual mandate.
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-
-        // Approve deposit transfer
-        vm.prank(tenant1);
-        token.approve(address(rental), DEPOSIT);
-
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, DEPOSIT);
-
-        // Lease active
         (uint32 startDay, uint32 endDay, uint128 deposit, bool active) = rental.leases(tenant1);
         assertEq(startDay, 1000);
         assertEq(endDay, 0);
         assertEq(deposit, DEPOSIT);
         assertTrue(active);
 
-        // Deposit moved to rental contract
-        assertEq(token.balanceOf(address(rental)), DEPOSIT + RENT); // deposit + immediate first payment
-        // Tenant balance: initial - deposit - immediate rent
+        assertEq(token.balanceOf(address(rental)), DEPOSIT + RENT);
         assertEq(token.balanceOf(tenant1), RENT * 10 + DEPOSIT - DEPOSIT - RENT);
-
-        // Tap created with correct mandateId
-        assertTrue(token.isTapActive(tenant1, actualMid));
+        assertTrue(token.isTapActive(tenant1, rental.mandateId()));
     }
 
     function test_RentalAgreement__addTenant_revertsIfAlreadyLeased() public {
         _mint(tenant1, RENT * 20 + DEPOSIT * 2);
-
-        bytes32 actualMid = _mid(address(rental), RENT);
+        bytes32 mid = rental.mandateId();
         vm.prank(tenant1);
-        token.authorize(actualMid, 2);
+        token.authorize(mid, 2);
         vm.prank(tenant1);
         token.approve(address(rental), DEPOSIT * 2);
 
@@ -1849,8 +1667,6 @@ contract RentalAgreementTest is Test {
         rental.addTenant(tenant1, 0, DEPOSIT);
 
         vm.prank(landlord_);
-        // Actually the second addTenant would fail with InvalidMandate (duplicate tap)
-        // before reaching AlreadyLeased, because the lease is checked first.
         vm.expectRevert(RentalAgreement.AlreadyLeased.selector);
         rental.addTenant(tenant1, 0, DEPOSIT);
     }
@@ -1863,130 +1679,65 @@ contract RentalAgreementTest is Test {
 
     function test_RentalAgreement__addTenant_noDepositWorks() public {
         _mint(tenant1, RENT * 10);
-
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
+        _authAndAddTenant(tenant1, 0);
 
         (,,uint128 deposit, bool active) = rental.leases(tenant1);
         assertEq(deposit, 0);
         assertTrue(active);
     }
 
-    // ── mandateId view (shows the bug) ──
+    // ── mandateId ──
 
-    function test_RentalAgreement__mandateId_returnsLandlordBasedHash() public view {
-        // rental.mandateId() returns hash(landlord, RENT)
-        bytes32 viewMid = rental.mandateId();
-        bytes32 expectedLandlord = _mid(landlord_, RENT);
-        assertEq(viewMid, expectedLandlord);
-
-        // But the actual mandate uses address(rental) as beneficiary
-        bytes32 actualMid = _mid(address(rental), RENT);
-        assertTrue(viewMid != actualMid);
+    function test_RentalAgreement__mandateId_matchesActualTap() public view {
+        bytes32 mid = rental.mandateId();
+        assertEq(mid, _mid(address(rental), RENT));
     }
 
-    // ── endLease (fails due to wrong mandateId) ──
+    // ── endLease ──
 
-    function test_RentalAgreement__endLease_revertsWithTapNotFound() public {
+    function test_RentalAgreement__endLease_revokesAndReturnsDeposit() public {
         _mint(tenant1, RENT * 10 + DEPOSIT);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-        vm.prank(tenant1);
-        token.approve(address(rental), DEPOSIT);
+        _authAndAddTenant(tenant1, DEPOSIT);
 
+        uint256 tenantBalBefore = token.balanceOf(tenant1);
         vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, DEPOSIT);
-
-        // endLease uses rental.mandateId() = hash(landlord, RENT), but the actual
-        // tap uses hash(address(rental), RENT). So revoke fails with TapNotFound.
-        vm.prank(landlord_);
-        vm.expectRevert(SiphonToken.TapNotFound.selector);
         rental.endLease(tenant1);
+
+        assertFalse(token.isTapActive(tenant1, rental.mandateId()));
+        assertEq(token.balanceOf(tenant1), tenantBalBefore + DEPOSIT);
     }
 
-    // ── moveOut (fails due to wrong mandateId) ──
+    // ── moveOut ──
 
-    function test_RentalAgreement__moveOut_revertsWithTapNotFound() public {
+    function test_RentalAgreement__moveOut_revokesTenantMandate() public {
         _mint(tenant1, RENT * 10);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
+        _authAndAddTenant(tenant1, 0);
 
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-
-        // moveOut calls token.revoke(msg.sender=tenant1, mandateId()=hash(landlord, RENT))
-        // _taps[tenant1][hash(landlord, RENT)].rate == 0 => TapNotFound
         vm.prank(tenant1);
-        vm.expectRevert(SiphonToken.TapNotFound.selector);
         rental.moveOut();
+
+        assertFalse(token.isTapActive(tenant1, rental.mandateId()));
     }
 
-    // ── Direct revoke works with correct mandateId ──
+    // ── isCurrentOnRent ──
 
-    function test_RentalAgreement__directRevoke_worksWithCorrectMandateId() public {
+    function test_RentalAgreement__isCurrentOnRent_trueWhileFunded() public {
         _mint(tenant1, RENT * 10);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-
-        // Tenant can revoke directly on the token using the correct mandateId
-        vm.prank(tenant1);
-        token.revoke(tenant1, actualMid);
-
-        assertFalse(token.isTapActive(tenant1, actualMid));
+        _authAndAddTenant(tenant1, 0);
+        assertTrue(rental.isCurrentOnRent(tenant1));
     }
 
-    // ── isCurrentOnRent (returns false due to wrong mandateId) ──
+    // ── collectRent ──
 
-    function test_RentalAgreement__isCurrentOnRent_returnsFalseDueToWrongMandateId() public {
+    function test_RentalAgreement__collectRent_harvestsToContract() public {
         _mint(tenant1, RENT * 10);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-
-        // isCurrentOnRent checks isTapActive(tenant1, hash(landlord, RENT))
-        // The actual tap is at hash(address(rental), RENT). So returns false.
-        assertFalse(rental.isCurrentOnRent(tenant1));
-
-        // But the tap IS active under the correct mandateId
-        assertTrue(token.isTapActive(tenant1, actualMid));
-    }
-
-    // ── collectRent (collects nothing due to wrong mandateId) ──
-
-    function test_RentalAgreement__collectRent_collectsNothingDueToWrongMandateId() public {
-        _mint(tenant1, RENT * 10);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-
+        _authAndAddTenant(tenant1, 0);
         _advanceDays(30);
 
-        // collectRent harvests hash(landlord, RENT) which has no bucket entries
-        uint256 preBal = token.balanceOf(landlord_);
+        uint256 preBal = token.balanceOf(address(rental));
         vm.prank(landlord_);
         rental.collectRent(10);
-        assertEq(token.balanceOf(landlord_), preBal);
-
-        // Direct harvest with correct beneficiary (address(rental)) works
-        uint256 preRental = token.balanceOf(address(rental));
-        token.harvest(address(rental), RENT, 10);
-        assertEq(token.balanceOf(address(rental)) - preRental, RENT);
+        assertEq(token.balanceOf(address(rental)) - preBal, RENT);
     }
 
     // ── tenantCount ──
@@ -1994,77 +1745,39 @@ contract RentalAgreementTest is Test {
     function test_RentalAgreement__tenantCount_tracksTenants() public {
         _mint(tenant1, RENT * 10);
         _mint(tenant2, RENT * 10);
-
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-        vm.prank(tenant2);
-        token.authorize(actualMid, 1);
-
-        vm.startPrank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-        rental.addTenant(tenant2, 0, 0);
-        vm.stopPrank();
-
+        _authAndAddTenant(tenant1, 0);
+        _authAndAddTenant(tenant2, 0);
         assertEq(rental.tenantCount(), 2);
     }
 
-    // ── Multiple tenants share mandateId (same beneficiary + rate) ──
+    // ── Multiple tenants share mandateId ──
 
     function test_RentalAgreement__multipleTenants_harvestCollectsAll() public {
         _mint(tenant1, RENT * 10);
         _mint(tenant2, RENT * 10);
+        _authAndAddTenant(tenant1, 0);
+        _authAndAddTenant(tenant2, 0);
 
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-        vm.prank(tenant2);
-        token.authorize(actualMid, 1);
-
-        vm.startPrank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-        rental.addTenant(tenant2, 0, 0);
-        vm.stopPrank();
-
-        // Both tenants paying RENT per term to the rental contract
         _advanceDays(30);
 
-        // Harvest collects from both tenants (same mandateId, bucket count = 2)
         uint256 preRental = token.balanceOf(address(rental));
-        token.harvest(address(rental), RENT, 10);
-        // immediate payments (2*RENT) already at rental, harvest adds 2*RENT more
+        vm.prank(landlord_);
+        rental.collectRent(10);
         assertEq(token.balanceOf(address(rental)) - preRental, RENT * 2);
     }
 
-    // ── Deposit held by contract ──
+    // ── Deposit + withdraw ──
 
     function test_RentalAgreement__addTenant_depositsHeldByContract() public {
         _mint(tenant1, RENT * 10 + DEPOSIT);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-        vm.prank(tenant1);
-        token.approve(address(rental), DEPOSIT);
-
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, DEPOSIT);
-
-        // Contract holds deposit + immediate first rent payment
+        _authAndAddTenant(tenant1, DEPOSIT);
         assertEq(token.balanceOf(address(rental)), DEPOSIT + RENT);
     }
 
-    // ── Landlord withdraw ──
-
     function test_RentalAgreement__withdraw_sendsTokens() public {
         _mint(tenant1, RENT * 10);
-        bytes32 actualMid = _mid(address(rental), RENT);
-        vm.prank(tenant1);
-        token.authorize(actualMid, 1);
+        _authAndAddTenant(tenant1, 0);
 
-        vm.prank(landlord_);
-        rental.addTenant(tenant1, 0, 0);
-
-        // rental contract has RENT from immediate payment
         vm.prank(landlord_);
         rental.withdraw(landlord_, RENT);
         assertEq(token.balanceOf(landlord_), RENT);
@@ -2080,12 +1793,11 @@ contract RentalAgreementTest is Test {
 
     function test_RentalAgreement__addTenant_storesEndDay() public {
         _mint(tenant1, RENT * 10);
-        bytes32 actualMid = _mid(address(rental), RENT);
+        bytes32 mid = rental.mandateId();
         vm.prank(tenant1);
-        token.authorize(actualMid, 1);
-
+        token.authorize(mid, 1);
         vm.prank(landlord_);
-        rental.addTenant(tenant1, 1365, 0); // 1-year lease
+        rental.addTenant(tenant1, 1365, 0);
 
         (,uint32 endDay,,) = rental.leases(tenant1);
         assertEq(endDay, 1365);

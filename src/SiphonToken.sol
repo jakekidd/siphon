@@ -73,7 +73,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     event Revoked(address indexed user, bytes32 indexed mandateId, uint32 revokedAt);
     event Settled(address indexed user, uint256 amount);
     event Authorized(address indexed user, bytes32 indexed mandateId, uint256 count);
-    event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
     event Harvested(address indexed beneficiary, bytes32 indexed mandateId, uint256 amount, uint256 epochs);
     event Comped(address indexed user, bytes32 indexed mandateId, uint16 epochs);
@@ -443,32 +442,32 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     /// @dev Revoke a mandate. Immediate termination — the bank stops the payment.
     ///      Bucket entry is preserved so the beneficiary can harvest historical
     ///      epochs. Exit is moved to current epoch to stop future earnings.
+    ///      Tap is deleted so the same mandateId can be re-tapped later.
     function _revoke(address _user, bytes32 _mid) internal {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
         if (t.revokedAt > 0) revert NotActive();
 
-        t.revokedAt = uint32(_today());
-
+        uint128 rate = t.rate;
         Account storage a = _accounts[_user];
-        a.outflow -= t.rate;
-        bool isBurn = _mandateId(address(0), t.rate) == _mid;
-        if (isBurn) _burnOutflow[_user] -= t.rate;
+        a.outflow -= rate;
+        bool isBurn = _mandateId(address(0), rate) == _mid;
+        if (isBurn) _burnOutflow[_user] -= rate;
         _anchor[_user] = uint32(_today());
 
         // Move exit to current epoch (preserves entry for historical harvest)
         if (!isBurn) {
             uint32 oldExit = _mandateExitEpoch[_user][_mid];
             if (oldExit > 0) _exits[_mid][uint256(oldExit)]--;
-            uint256 curEpoch = _epochOf();
-            _exits[_mid][curEpoch + 1]++;
+            _exits[_mid][_epochOf() + 1]++;
         }
 
+        delete _taps[_user][_mid];
         delete _mandateExitEpoch[_user][_mid];
         _removeFromUserTaps(_user, _mid);
         _recomputeAllExits(_user);
 
-        emit Revoked(_user, _mid, t.revokedAt);
+        emit Revoked(_user, _mid, uint32(_today()));
         if (_userTaps[_user].length == 0) _notifyListener(_user, false);
     }
 

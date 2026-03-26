@@ -46,9 +46,9 @@ contract RentalAgreement {
     }
 
     /// @notice The mandateId for this rental agreement. All tenants share it
-    ///         (same landlord, same rent = same hash).
+    ///         (same beneficiary contract, same rent = same hash).
     function mandateId() public view returns (bytes32) {
-        return token.mandateId(landlord, rent);
+        return token.mandateId(address(this), rent);
     }
 
     // ── Landlord flow ──
@@ -99,9 +99,10 @@ contract RentalAgreement {
     }
 
     /// @notice Harvest all rent. Since all tenants share the same mandateId,
-    ///         one harvest call collects from everyone.
+    ///         one harvest call collects from everyone. Tokens go to this
+    ///         contract; landlord withdraws via withdraw().
     function collectRent(uint256 _maxEpochs) external onlyLandlord {
-        token.harvest(landlord, rent, _maxEpochs);
+        token.harvest(address(this), rent, _maxEpochs);
     }
 
     /// @notice Withdraw collected rent.

@@ -6,13 +6,21 @@ import {IScheduleListener} from "../interfaces/IScheduleListener.sol";
 
 /**
  * @title Payroll — Employer pays employees via SiphonToken mandates
- * @notice Demonstrates: employer as user with multiple taps to different
- *         beneficiaries at different rates. Employees harvest their own pay.
- *         Uses IScheduleListener to detect when payroll taps lapse.
+ * @notice Demonstrates the "one payer, many beneficiaries" pattern.
  *
- *         The employer holds tokens. Each employee is a beneficiary with a
- *         mandate at their salary rate. The employer's balance decays as
- *         salaries are paid. Employees call harvest() to collect.
+ *         The employer holds tokens. Each employee is a beneficiary at their
+ *         salary rate. The employer's balance decays as salaries are paid.
+ *
+ *         This contract is bookkeeping only — it tracks the roster and
+ *         provides views. The employer and employees interact with the
+ *         token directly for mandate operations:
+ *
+ *         1. Employer: token.authorize(mandateId(employee, salary), max)
+ *         2. Employee: token.tap(employer, salary)   — activates pay
+ *         3. Employee: token.harvest(employee, salary, epochs) — collects pay
+ *         4. Employer: token.revoke(employer, mandateId)  — terminates pay
+ *
+ *         Uses IScheduleListener to detect when payroll funds lapse.
  */
 contract Payroll is IScheduleListener {
     SiphonToken public immutable token;
@@ -44,58 +52,26 @@ contract Payroll is IScheduleListener {
 
     // ── Admin ──
 
-    /// @notice Hire an employee. Employer must have authorized the mandate
-    ///         for this employee's salary: token.authorize(mandateId, type(uint256).max)
-    ///         (infinite authorization since payroll is ongoing).
+    /// @notice Add an employee to the roster. Employer must separately
+    ///         authorize the mandate on the token. Employee then calls
+    ///         token.tap(employer, salary) to activate their pay.
     function hire(address _employee, string calldata _title, uint128 _salary) external onlyEmployer {
         if (employees[_employee].active) revert AlreadyEmployed();
-
         employees[_employee] = Employee(_title, _salary, true);
         roster.push(_employee);
-
-        // Employee (beneficiary) taps the employer (user)
-        // The employee calls tap() since they are the beneficiary (msg.sender)
-        // Actually: the employer authorized the mandate. The employee calls tap().
-        // But tap() requires msg.sender == beneficiary. So the employee must call it.
-        // For onboarding, the employer can't call tap on behalf of the employee.
-        // Solution: we call _tap internally if we inherit SiphonToken, or the
-        // employee calls tap() themselves after being added to the roster.
-
         emit Hired(_employee, _title, _salary);
     }
 
-    /// @notice Employee activates their payroll tap. Call after being hired.
-    ///         The employee IS the beneficiary; they call tap() on the token
-    ///         which draws from the employer's balance.
-    function activate() external {
-        Employee storage emp = employees[msg.sender];
-        if (!emp.active) revert NotEmployee();
-
-        // msg.sender (employee) is the beneficiary; employer is the user being tapped
-        token.tap(employer, emp.salary);
-    }
-
-    /// @notice Terminate an employee's payroll. Employer revokes the mandate.
+    /// @notice Remove an employee from the roster. Employer must separately
+    ///         revoke the mandate on the token.
     function terminate(address _employee) external onlyEmployer {
         Employee storage emp = employees[_employee];
         if (!emp.active) revert NotEmployee();
-
-        bytes32 mid = token.mandateId(_employee, emp.salary);
-        token.revoke(employer, mid);
         emp.active = false;
-
         emit Terminated(_employee);
     }
 
-    // ── Employee flow ──
-
-    /// @notice Employee collects their salary.
-    function collectSalary(uint256 _maxEpochs) external {
-        Employee storage emp = employees[msg.sender];
-        if (!emp.active) revert NotEmployee();
-
-        token.harvest(msg.sender, emp.salary, _maxEpochs);
-    }
+    // ── Views ──
 
     /// @notice Check if payroll is funded for an employee.
     function isPaid(address _employee) external view returns (bool) {
@@ -104,8 +80,6 @@ contract Payroll is IScheduleListener {
         bytes32 mid = token.mandateId(_employee, emp.salary);
         return token.isTapActive(employer, mid);
     }
-
-    // ── Views ──
 
     function rosterSize() external view returns (uint256) {
         return roster.length;
@@ -122,9 +96,9 @@ contract Payroll is IScheduleListener {
 
     /// @notice Called by the token when the employer's schedule state changes.
     ///         Detects when payroll funds run out.
-    function onScheduleUpdate(address _token, address _user, bool _active) external {
+    function onScheduleUpdate(address, address _user, bool _active) external {
         if (msg.sender != address(token)) return;
-        if (_user != employer && !_active) {
+        if (_user == employer && !_active) {
             emit PayrollLapsed(employer);
         }
     }
