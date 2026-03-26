@@ -5,7 +5,7 @@ import {SiphonToken} from "../SiphonToken.sol";
 
 /**
  * @title StreamingSubscription — Subscription service backed by SiphonToken mandates
- * @notice Demonstrates: subscribe, upgrade/downgrade plans, sponsored trials,
+ * @notice Demonstrates: subscribe, upgrade/downgrade plans, comp (free months),
  *         access gating via isTapActive, and harvest. The contract IS the
  *         beneficiary; it taps users and collects payments.
  */
@@ -99,19 +99,6 @@ contract StreamingSubscription {
         Plan storage plan = plans[_planId];
         if (plan.rate == 0) revert InvalidPlan();
         token.comp(_user, plan.rate, _months);
-    }
-
-    // ── Sponsored trial ──
-
-    /// @notice Sponsor tokens for a user's mandate. Locked and consumed
-    ///         before the user's own balance (extends runway, not free months).
-    function sponsorTrial(address _user, uint256 _planId, uint8 _months) external {
-        Plan storage plan = plans[_planId];
-        if (plan.rate == 0) revert InvalidPlan();
-
-        bytes32 mid = token.mandateId(address(this), plan.rate);
-        uint128 amount = plan.rate * uint128(_months);
-        token.sponsor(_user, mid, amount);
     }
 
     // ── Access gating ──

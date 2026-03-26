@@ -252,8 +252,7 @@ contract SimpleSiphonTest is Test {
         _advanceDays(60); // 2 periods elapsed > 1 funded
 
         token.settle(alice);
-        // Lapse triggers _resolvePriority. principal = 0, outflow = RATE.
-        // avail = 0 + 0 sponsored < RATE => lapse. Tap removed.
+        // Lapse triggers _resolvePriority. principal = 0 < RATE => lapse. Tap removed.
         (uint128 principal, uint128 outflow,) = token.getAccount(alice);
         assertEq(principal, 0);
         assertEq(outflow, 0);
@@ -445,16 +444,10 @@ contract SimpleSiphonTest is Test {
     // ================================================================
 
     function test_SiphonToken__settle_resolvePriorityOnLapse() public {
-        // Give alice enough for 1 period of 3 taps + first payments
-        // 3 taps at RATE each: immediate = 3*RATE, then need 1 period = 3*RATE
-        // Total needed: 6*RATE. Give 5*RATE so she can pay immediate but not 1 full period for all.
-        // Actually: immediate = 3*RATE. principal = 2*RATE. outflow = 3*RATE. funded = 0.
+        // 3 taps at RATE each: immediate = 3*RATE. principal = 2*RATE. outflow = 3*RATE. funded = 0.
         // After 30 days: elapsed=1 > funded=0 => lapse.
-        // Priority: tap 1 has avail = remaining(2*RATE) + 0 sponsored >= RATE => survives.
-        //           remaining = 2*RATE - RATE = RATE.
-        //           tap 2 has avail = RATE + 0 >= RATE => survives.
-        //           remaining = 0.
-        //           tap 3 has avail = 0 < RATE => lapse.
+        // Priority: remaining=2*RATE. tap1 survives (remaining-=RATE). tap2 survives (remaining=0).
+        //           tap3: 0 < RATE => lapsed.
 
         _mint(alice, RATE * 5);
         _tapViaSched(alice, treasury, RATE);   // first-tapped
@@ -465,15 +458,8 @@ contract SimpleSiphonTest is Test {
         _advanceDays(30); // elapsed=1, funded=0 => lapse
         token.settle(alice);
 
-        // After priority resolution: first two survive (paid 1 period each from remaining 2*RATE),
-        // third lapsed. But wait — settle deducts consumed first. funded=0 so periods=0, con=0.
-        // Then elapsed(1) > funded(0) => _resolvePriority.
-        // remaining = principal = 2*RATE.
-        // tap1 (treasury,RATE): avail = 2*RATE >= RATE => survives. remaining = RATE.
-        // tap2 (bob,RATE): avail = RATE >= RATE => survives. remaining = 0.
-        // tap3 (carol,RATE): avail = 0 < RATE => lapsed.
-        // a.principal = 0. But the surviving taps still have outflow = 2*RATE.
-        // Actually, lapse removes tap3's rate from outflow. So outflow = 2*RATE.
+        // settle: funded=0, con=0. elapsed(1) > funded(0) => _resolvePriority.
+        // remaining=2*RATE. tap1 survives (-RATE). tap2 survives (-RATE). tap3 lapses (0 < RATE).
 
         bytes32[] memory taps = token.getUserTaps(alice);
         assertEq(taps.length, 2, "two taps should survive");
@@ -574,81 +560,6 @@ contract SimpleSiphonTest is Test {
         vm.prank(treasury);
         token.tap(alice, rate2);
         assertEq(token.authorization(alice, mid2), type(uint256).max);
-    }
-
-    // ================================================================
-    //  8. Sponsorship: extends runway, survives past lapse, accounting
-    // ================================================================
-
-    function test_SiphonToken__sponsor_locksTokensForMandate() public {
-        _mint(alice, RATE * 3);
-        _tapViaSched(alice, treasury, RATE);
-        bytes32 mid = _mid(treasury, RATE);
-
-        // bob sponsors 2*RATE for alice's mandate with treasury
-        _mint(bob, RATE * 2);
-        vm.prank(bob);
-        token.sponsor(alice, mid, uint128(RATE * 2));
-
-        (, , , uint256 sponsored) = token.getTap(alice, mid);
-        assertEq(sponsored, RATE * 2);
-
-        // bob's balance reduced
-        assertEq(token.balanceOf(bob), 0);
-    }
-
-    function test_SiphonToken__sponsor_extendsMandateRunway() public {
-        // alice has 2*RATE: immediate uses RATE, principal = RATE, outflow = RATE.
-        // Without sponsorship: funded = 1 period. Lapses after period 1.
-        _mint(alice, RATE * 2);
-        _tapViaSched(alice, treasury, RATE);
-        bytes32 mid = _mid(treasury, RATE);
-
-        // sponsor 2*RATE => 2 extra periods for this mandate
-        _mint(bob, RATE * 2);
-        vm.prank(bob);
-        token.sponsor(alice, mid, uint128(RATE * 2));
-
-        // Advance 60 days (2 periods). Without sponsor: lapse at period 1.
-        // With sponsor: principal funds 1 period, sponsored funds 2 => 3 total.
-        _advanceDays(60);
-        // elapsed=2. balance = principal(RATE) - min(2, funded=1)*outflow(RATE) = 0
-        // But isTapActive considers sponsorship
-        assertTrue(token.isTapActive(alice, mid));
-    }
-
-    function test_SiphonToken__sponsor_survivesLapseViaPriority() public {
-        // alice has only enough for immediate payments.
-        // tap1 is sponsored, tap2 is not.
-        _mint(alice, RATE * 2);
-        _tapViaSched(alice, treasury, RATE);
-        _tapViaSched(alice, bob, RATE);
-        // principal = 0, outflow = 2*RATE
-
-        bytes32 mid1 = _mid(treasury, RATE);
-
-        // Sponsor tap1 with 1 period worth
-        _mint(carol, RATE);
-        vm.prank(carol);
-        token.sponsor(alice, mid1, RATE);
-
-        _advanceDays(30);
-        token.settle(alice);
-
-        // tap1 survives via sponsorship (RATE sponsored >= RATE rate)
-        // tap2 has 0 remaining + 0 sponsored < RATE => lapsed
-        bytes32[] memory taps = token.getUserTaps(alice);
-        assertEq(taps.length, 1);
-        assertEq(taps[0], mid1);
-    }
-
-    function test_SiphonToken__sponsor_revertsIfTapNotFound() public {
-        _mint(alice, RATE * 4);
-        bytes32 fakeMid = _mid(treasury, RATE);
-        _mint(bob, RATE);
-        vm.prank(bob);
-        vm.expectRevert(SiphonToken.TapNotFound.selector);
-        token.sponsor(alice, fakeMid, RATE);
     }
 
     // ================================================================
@@ -883,16 +794,10 @@ contract SimpleSiphonTest is Test {
         assertEq(token.totalSupply(), RATE);
     }
 
-    function test_SiphonToken__totalSpent_includesSponsorships() public {
+    function test_SiphonToken__totalSpent_tracksMultipleSpends() public {
         _mint(alice, RATE * 4);
-        _tapViaSched(alice, treasury, RATE);
-        bytes32 mid = _mid(treasury, RATE);
-
-        _mint(bob, RATE * 2);
-        vm.prank(bob);
-        token.sponsor(alice, mid, uint128(RATE * 2));
-
-        // Sponsor deducts from bob and increments totalSpent
+        _spend(alice, RATE);
+        _spend(alice, RATE);
         assertEq(token.totalSpent(), RATE * 2);
     }
 
@@ -1021,11 +926,10 @@ contract SimpleSiphonTest is Test {
         _tapViaSched(alice, treasury, RATE);
         bytes32 mid = _mid(treasury, RATE);
 
-        (uint128 rate, uint32 entryEpoch, uint32 revokedAt, uint256 sponsored) = token.getTap(alice, mid);
+        (uint128 rate, uint32 entryEpoch, uint32 revokedAt) = token.getTap(alice, mid);
         assertEq(rate, RATE);
         assertEq(entryEpoch, 1); // currentEpoch(0) + 1
         assertEq(revokedAt, 0);
-        assertEq(sponsored, 0);
     }
 
     function test_SiphonToken__consumed_returnsCorrectAmount() public {
@@ -1432,32 +1336,6 @@ contract StreamingSubscriptionTest is Test {
         vm.prank(alice);
         vm.expectRevert(StreamingSubscription.NotSubscribed.selector);
         sub.changePlan(premiumId);
-    }
-
-    function test_StreamingSubscription__sponsorTrial_locksFundsForMandate() public {
-        (uint256 basicId,) = _createPlans();
-        _mint(alice, BASIC_RATE * 4);
-
-        bytes32 mid = _mid(address(sub), BASIC_RATE);
-        vm.prank(alice);
-        token.authorize(mid, 1);
-
-        vm.prank(alice);
-        sub.subscribe(basicId);
-
-        // sponsorTrial calls token.sponsor from address(sub), so the sub contract
-        // needs tokens (msg.sender in sponsor = address(sub)). Mint to sub.
-        _mint(address(sub), BASIC_RATE * 3);
-        uint256 subBalBefore = token.balanceOf(address(sub));
-
-        vm.prank(bob);
-        sub.sponsorTrial(alice, basicId, 3);
-
-        (, , , uint256 sponsored) = token.getTap(alice, mid);
-        assertEq(sponsored, BASIC_RATE * 3);
-
-        // Sub contract balance reduced by sponsored amount
-        assertEq(token.balanceOf(address(sub)), subBalBefore - BASIC_RATE * 3);
     }
 
     function test_StreamingSubscription__collect_harvestsRevenue() public {

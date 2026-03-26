@@ -28,10 +28,9 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  *     Burn mandates have beneficiary=address(0). Same array, same outflow.
  *     No authorization needed (self-assigned). No bucket ops (no harvest).
  *
- *   SPONSORSHIP
- *     Anyone can sponsor tokens for a user's specific mandate. Sponsored
- *     tokens are locked and consumed BEFORE principal. A sponsored mandate
- *     can survive past shared lapse.
+ *   COMP
+ *     Beneficiary can pause billing for N terms via comp(). Moves the
+ *     user's anchor forward; balance freezes, resumes automatically.
  *
  *   PRIORITY
  *     When funds run out, mandates are resolved in tap order (first-tapped
@@ -74,7 +73,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     event Revoked(address indexed user, bytes32 indexed mandateId, uint32 revokedAt);
     event Settled(address indexed user, uint256 amount);
     event Authorized(address indexed user, bytes32 indexed mandateId, uint256 count);
-    event Sponsored(address indexed user, bytes32 indexed mandateId, uint256 amount);
     event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
     event Harvested(address indexed beneficiary, bytes32 indexed mandateId, uint256 amount, uint256 epochs);
@@ -138,7 +136,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     mapping(address => bytes32[]) internal _userTaps;
     mapping(address => mapping(bytes32 => Tap)) internal _taps;
     mapping(address => mapping(bytes32 => uint32)) internal _mandateExitEpoch;
-    mapping(address => mapping(bytes32 => uint256)) internal _sponsored;
 
     /// @dev Per-user burn outflow (subset of outflow that's burn mandates).
     mapping(address => uint128) internal _burnOutflow;
@@ -218,9 +215,9 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return (a.principal, a.outflow, _anchor[_user]);
     }
 
-    function getTap(address _user, bytes32 _mid) external view returns (uint128 rate, uint32 entryEpoch, uint32 revokedAt, uint256 sponsored) {
+    function getTap(address _user, bytes32 _mid) external view returns (uint128 rate, uint32 entryEpoch, uint32 revokedAt) {
         Tap storage t = _taps[_user][_mid];
-        return (t.rate, t.entryEpoch, t.revokedAt, _sponsored[_user][_mid]);
+        return (t.rate, t.entryEpoch, t.revokedAt);
     }
 
     function getUserTaps(address _user) external view returns (bytes32[] memory) {
@@ -234,7 +231,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function isActive(address _user) external view returns (bool) {
         Account storage a = _accounts[_user];
         if (a.outflow == 0) return false;
-        return _funded(a) > 0 || _hasAnySponsoredActive(_user);
+        return _funded(a) > 0;
     }
 
     function isTapActive(address _user, bytes32 _mid) external view returns (bool) {
@@ -242,10 +239,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (t.rate == 0) return false;
         if (t.revokedAt > 0) return false;
         Account storage a = _accounts[_user];
-        uint256 elapsed = _periodsElapsed(_user);
-        uint256 funded = _funded(a);
-        if (elapsed <= funded) return true;
-        return _sponsored[_user][_mid] >= t.rate;
+        return _periodsElapsed(_user) <= _funded(a);
     }
 
     function currentDay() external view returns (uint256) {
@@ -349,25 +343,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     // ──────────────────────────────────────────────
-    // Public: Sponsor
-    // ──────────────────────────────────────────────
-
-    /// @notice Sponsor tokens for a user's specific mandate. Tokens are locked
-    ///         and consumed before principal for that mandate.
-    function sponsor(address _user, bytes32 _mid, uint128 _amount) external {
-        Tap storage t = _taps[_user][_mid];
-        if (t.rate == 0) revert TapNotFound();
-
-        _debit(msg.sender, _amount);
-        totalSpent += _amount;
-        _sponsored[_user][_mid] += _amount;
-        _recomputeTapExit(_user, _mid);
-
-        emit Transfer(msg.sender, address(this), _amount);
-        emit Sponsored(_user, _mid, _amount);
-    }
-
-    // ──────────────────────────────────────────────
     // Public: Comp (beneficiary pauses billing)
     // ──────────────────────────────────────────────
 
@@ -418,14 +393,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit Transfer(_from, _to, _amount);
     }
 
-    /// @dev Debit principal from a user (for sponsor). Settles + balance check.
-    function _debit(address _from, uint128 _amount) internal {
-        _settle(_from);
-        if (_balance(_from) < _amount) revert InsufficientBalance();
-        _accounts[_from].principal -= _amount;
-        _recomputeAllExits(_from);
-    }
-
     /// @dev Tap a user into a mandate.
     function _tap(address _user, address _beneficiary, uint128 _rate) internal {
         if (_rate == 0) revert InvalidMandate();
@@ -474,7 +441,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     /// @dev Revoke a mandate. Immediate termination — the bank stops the payment.
-    ///      Service continuation is the consumer's concern, not the token's.
+    ///      Bucket entry is preserved so the beneficiary can harvest historical
+    ///      epochs. Exit is moved to current epoch to stop future earnings.
     function _revoke(address _user, bytes32 _mid) internal {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
@@ -488,9 +456,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (isBurn) _burnOutflow[_user] -= t.rate;
         _anchor[_user] = uint32(_today());
 
-        // Remove from buckets immediately (no service continuation)
+        // Move exit to current epoch (preserves entry for historical harvest)
         if (!isBurn) {
-            _removeTapFromBuckets(_user, _mid);
+            uint32 oldExit = _mandateExitEpoch[_user][_mid];
+            if (oldExit > 0) _exits[_mid][uint256(oldExit)]--;
+            uint256 curEpoch = _epochOf();
+            _exits[_mid][curEpoch + 1]++;
         }
 
         delete _mandateExitEpoch[_user][_mid];
@@ -632,6 +603,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     /// @dev Priority resolution: first-tapped survives, later taps lapse.
+    ///      Bucket entries/exits are left in place for lapsed taps so
+    ///      beneficiaries can still harvest their earned income.
     function _resolvePriority(address _user) internal {
         Account storage a = _accounts[_user];
         uint256 remaining = uint256(a.principal);
@@ -641,32 +614,17 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         while (i < taps.length) {
             bytes32 mid = taps[i];
             Tap storage t = _taps[_user][mid];
-            uint256 sponsoredBal = _sponsored[_user][mid];
-            uint256 avail = remaining + sponsoredBal;
 
-            if (avail >= uint256(t.rate)) {
-                if (sponsoredBal >= uint256(t.rate)) {
-                    _sponsored[_user][mid] = sponsoredBal - uint256(t.rate);
-                } else {
-                    uint256 fromPrincipal = uint256(t.rate) - sponsoredBal;
-                    _sponsored[_user][mid] = 0;
-                    remaining -= fromPrincipal;
-                }
+            if (remaining >= uint256(t.rate)) {
+                remaining -= uint256(t.rate);
                 i++;
             } else {
-                // Lapse — clean up
+                // Lapse — clean up tap but preserve bucket entries/exits
                 bool isBurn = _mandateId(address(0), t.rate) == mid;
-                if (!isBurn) {
-                    _removeTapFromBuckets(_user, mid);
-                }
                 a.outflow -= t.rate;
                 if (isBurn) _burnOutflow[_user] -= t.rate;
                 delete _taps[_user][mid];
                 delete _mandateExitEpoch[_user][mid];
-                if (sponsoredBal > 0) {
-                    delete _sponsored[_user][mid];
-                    // Sponsored tokens were already counted as totalSpent on sponsor()
-                }
 
                 for (uint256 j = i; j < taps.length - 1; j++) {
                     taps[j] = taps[j + 1];
@@ -693,14 +651,13 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         bytes32[] storage taps = _userTaps[_user];
         uint256 baseEpoch = _anchorEpoch(_user);
         uint256 sharedFunded = _funded(a);
+        uint256 newExit = baseEpoch + 1 + sharedFunded;
 
         for (uint256 i; i < taps.length; i++) {
             bytes32 mid = taps[i];
             bool isBurn = _mandateId(address(0), _taps[_user][mid].rate) == mid;
             if (isBurn) continue;
 
-            uint256 extraFunded = _sponsored[_user][mid] / uint256(_taps[_user][mid].rate);
-            uint256 newExit = baseEpoch + 1 + sharedFunded + extraFunded;
             uint32 oldExit = _mandateExitEpoch[_user][mid];
 
             if (uint256(oldExit) != newExit) {
@@ -708,41 +665,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
                 _exits[mid][newExit]++;
                 _mandateExitEpoch[_user][mid] = uint32(newExit);
             }
-        }
-    }
-
-    function _recomputeTapExit(address _user, bytes32 _mid) internal {
-        bool isBurn = _mandateId(address(0), _taps[_user][_mid].rate) == _mid;
-        if (isBurn) return;
-
-        Account storage a = _accounts[_user];
-        uint256 baseEpoch = _anchorEpoch(_user);
-        uint256 sharedFunded = _funded(a);
-        uint256 extraFunded = _sponsored[_user][_mid] / uint256(_taps[_user][_mid].rate);
-        uint256 newExit = baseEpoch + 1 + sharedFunded + extraFunded;
-        uint32 oldExit = _mandateExitEpoch[_user][_mid];
-
-        if (uint256(oldExit) != newExit) {
-            if (oldExit > 0) _exits[_mid][uint256(oldExit)]--;
-            _exits[_mid][newExit]++;
-            _mandateExitEpoch[_user][_mid] = uint32(newExit);
-        }
-    }
-
-    function _removeTapFromBuckets(address _user, bytes32 _mid) internal {
-        Checkpoint storage cp = _checkpoints[_mid];
-        Tap storage t = _taps[_user][_mid];
-
-        uint256 entryEpoch = uint256(t.entryEpoch);
-        if (entryEpoch > uint256(cp.lastEpoch)) {
-            uint256 e = _entries[_mid][entryEpoch];
-            if (e > 0) _entries[_mid][entryEpoch] = e - 1;
-        }
-
-        uint32 exitEpoch = _mandateExitEpoch[_user][_mid];
-        if (exitEpoch > 0 && uint256(exitEpoch) > uint256(cp.lastEpoch)) {
-            uint256 x = _exits[_mid][uint256(exitEpoch)];
-            if (x > 0) _exits[_mid][uint256(exitEpoch)] = x - 1;
         }
     }
 
@@ -757,14 +679,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
                 return;
             }
         }
-    }
-
-    function _hasAnySponsoredActive(address _user) internal view returns (bool) {
-        bytes32[] storage taps = _userTaps[_user];
-        for (uint256 i; i < taps.length; i++) {
-            if (_sponsored[_user][taps[i]] > 0) return true;
-        }
-        return false;
     }
 
     // ──────────────────────────────────────────────
