@@ -201,6 +201,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit Authorized(msg.sender, _mid, _count);
     }
 
+    /// @notice Remaining authorization count for a mandate.
     function authorization(address _user, bytes32 _mid) external view returns (uint256) {
         return _authorizations[_user][_mid];
     }
@@ -209,30 +210,36 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Views
     // ──────────────────────────────────────────────
 
+    /// @notice User's account: stored principal, aggregate outflow rate, billing anchor day.
     function getAccount(address _user) external view returns (uint128 principal, uint128 outflow, uint32 anchor) {
         Account storage a = _accounts[_user];
         return (a.principal, a.outflow, _anchor[_user]);
     }
 
+    /// @notice Details of a specific tap on a user.
     function getTap(address _user, bytes32 _mid) external view returns (uint128 rate, uint32 entryEpoch, uint32 revokedAt) {
         Tap storage t = _taps[_user][_mid];
         return (t.rate, t.entryEpoch, t.revokedAt);
     }
 
+    /// @notice All active mandate IDs for a user (ordered by priority).
     function getUserTaps(address _user) external view returns (bytes32[] memory) {
         return _userTaps[_user];
     }
 
+    /// @notice Tokens consumed by active mandates since last settlement (lazy, not yet materialized).
     function consumed(address _user) external view returns (uint256) {
         return _consumed(_user);
     }
 
+    /// @notice True if the user has any active mandates with funded periods remaining.
     function isActive(address _user) external view returns (bool) {
         Account storage a = _accounts[_user];
         if (a.outflow == 0) return false;
         return _funded(a) > 0;
     }
 
+    /// @notice True if a specific mandate is active and funded on this user.
     function isTapActive(address _user, bytes32 _mid) external view returns (bool) {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) return false;
@@ -241,24 +248,38 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return _periodsElapsed(_user) <= _funded(a);
     }
 
+    /// @notice Current day index (block.timestamp / 86400).
     function currentDay() external view returns (uint256) {
         return _today();
     }
 
+    /// @notice Current epoch index ((today - DEPLOY_DAY) / TERM_DAYS).
     function currentEpoch() external view returns (uint256) {
         return _epochOf();
     }
 
+    /// @notice Compute a mandateId from beneficiary address and rate.
     function mandateId(address _beneficiary, uint128 _rate) external pure returns (bytes32) {
         return _mandateId(_beneficiary, _rate);
     }
 
+    /// @notice Harvest checkpoint for a mandate: last harvested epoch and running subscriber count.
     function getCheckpoint(bytes32 _mid) external view returns (uint32 lastEpoch, uint224 count) {
         Checkpoint storage cp = _checkpoints[_mid];
         return (cp.lastEpoch, cp.count);
     }
 
-    /// @notice True if the user is in a comp period (anchor is in the future).
+    /// @notice Number of full terms the user can fund at current outflow.
+    function funded(address _user) external view returns (uint256) {
+        return _funded(_accounts[_user]);
+    }
+
+    /// @notice Day when the user's balance will be fully consumed at current outflow.
+    function expiryDay(address _user) external view returns (uint256) {
+        return uint256(_anchor[_user]) + _funded(_accounts[_user]) * uint256(TERM_DAYS);
+    }
+
+    /// @notice True if the user is in a comp period (billing anchor is in the future).
     function isComped(address _user) external view returns (bool) {
         return _today() < uint256(_anchor[_user]);
     }
@@ -267,6 +288,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Settle
     // ──────────────────────────────────────────────
 
+    /// @notice Trigger lazy settlement for a user. Anyone can call. No-op if
+    ///         no periods have elapsed since the last settlement.
     function settle(address _user) external {
         _settle(_user);
     }
@@ -310,6 +333,10 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
     /// @notice Harvest income for a mandate. Caller passes beneficiary + rate;
     ///         contract verifies the mandateId hash. Tokens go to beneficiary.
+    ///         Anyone can call; tokens always go to the beneficiary.
+    /// @dev total is accumulated as uint256 but principal is uint128. If total
+    ///      exceeds uint128.max (requires extreme rate * epochs * subscribers),
+    ///      the call reverts. Harvest more frequently to stay under the cap.
     function harvest(address _beneficiary, uint128 _rate, uint256 _maxEpochs) external {
         bytes32 mid = _mandateId(_beneficiary, _rate);
         Checkpoint storage cp = _checkpoints[mid];
@@ -336,6 +363,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         cp.count = uint224(running);
 
         if (total > 0) {
+            require(total <= type(uint128).max, "harvest overflow");
             _accounts[_beneficiary].principal += uint128(total);
             emit Harvested(_beneficiary, mid, total, end - last);
         }
@@ -358,6 +386,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Mutations
     // ──────────────────────────────────────────────
 
+    /// @dev Mint tokens to a user. Settles first, then increases principal.
     function _mint(address _user, uint128 _amount) internal {
         _settle(_user);
         _accounts[_user].principal += _amount;
@@ -366,6 +395,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit Transfer(address(0), _user, _amount);
     }
 
+    /// @dev Burn tokens from a user. Settles first, checks balance, decreases principal.
     function _spend(address _user, uint128 _amount) internal {
         _settle(_user);
         if (_balance(_user) < _amount) revert InsufficientBalance();
@@ -376,6 +406,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit Spent(_user, _amount);
     }
 
+    /// @dev Transfer between users. Settles both sides. Recomputes exits for both
+    ///      (principal changes affect funded periods and therefore bucket exits).
     function _transfer(address _from, address _to, uint256 _amount) internal {
         if (_from == address(0)) revert ERC20InvalidSender(address(0));
         if (_to == address(0)) revert ERC20InvalidReceiver(address(0));
@@ -392,7 +424,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit Transfer(_from, _to, _amount);
     }
 
-    /// @dev Tap a user into a mandate.
+    /// @dev Tap a user into a mandate. Immediate first-term payment to beneficiary.
     function _tap(address _user, address _beneficiary, uint128 _rate) internal {
         if (_rate == 0) revert InvalidMandate();
         if (_beneficiary == _user) revert InvalidBeneficiary();
@@ -514,10 +546,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Lazy Math
     // ──────────────────────────────────────────────
 
+    /// @dev Current day index. Virtual so tests can override for time travel.
     function _today() internal view virtual returns (uint256) {
         return block.timestamp / _SECONDS_PER_DAY;
     }
 
+    /// @dev Spendable balance: principal minus lazy consumed. O(1).
     function _balance(address _user) internal view returns (uint256) {
         Account storage a = _accounts[_user];
         if (a.outflow == 0) return uint256(a.principal);
@@ -525,15 +559,19 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return uint256(a.principal) - c;
     }
 
+    /// @dev Tokens consumed by mandates since last settlement. Capped at principal
+    ///      (can't consume more than what's there). Always: consumed + balance = principal.
     function _consumed(address _user) internal view returns (uint256) {
         Account storage a = _accounts[_user];
         if (a.outflow == 0) return 0;
         uint256 elapsed = _periodsElapsed(_user);
-        uint256 funded = _funded(a);
-        uint256 effective = elapsed < funded ? elapsed : funded;
+        uint256 f = _funded(a);
+        uint256 effective = elapsed < f ? elapsed : f;
         return effective * uint256(a.outflow);
     }
 
+    /// @dev Full billing periods elapsed since the user's anchor. Returns 0 during
+    ///      comp (anchor is in the future) and on the same day as last settlement.
     function _periodsElapsed(address _user) internal view returns (uint256) {
         uint32 anch = _anchor[_user];
         uint256 today = _today();
@@ -541,6 +579,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return (today - uint256(anch)) / uint256(TERM_DAYS);
     }
 
+    /// @dev How many full periods the user's principal can cover at current outflow.
+    ///      Integer division: dust below one period's outflow is not counted.
     function _funded(Account storage _a) internal view returns (uint256) {
         if (_a.outflow == 0) return 0;
         return uint256(_a.principal) / uint256(_a.outflow);
@@ -550,10 +590,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Epoch helpers
     // ──────────────────────────────────────────────
 
+    /// @dev Deterministic mandate identifier. Same beneficiary + same rate = same hash.
     function _mandateId(address _beneficiary, uint128 _rate) internal pure returns (bytes32) {
         return keccak256(abi.encode(_beneficiary, _rate));
     }
 
+    /// @dev Current epoch index. Epochs are TERM_DAYS-wide windows anchored at DEPLOY_DAY.
     function _epochOf() internal view returns (uint256) {
         uint256 today = _today();
         if (today <= uint256(DEPLOY_DAY)) return 0;
@@ -653,6 +695,9 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Bucket Management
     // ──────────────────────────────────────────────
 
+    /// @dev Update bucket exit epochs for all non-burn taps. Called after any
+    ///      change to principal or outflow. Exit = anchorEpoch + 1 + funded.
+    ///      Since all taps share principal/outflow, exit is the same for all.
     function _recomputeAllExits(address _user) internal {
         Account storage a = _accounts[_user];
         bytes32[] storage taps = _userTaps[_user];
@@ -675,6 +720,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         }
     }
 
+    /// @dev Remove a mandateId from the user's tap list. O(n) shift to preserve
+    ///      priority ordering (first-tapped = first-paid).
     function _removeFromUserTaps(address _user, bytes32 _mid) internal {
         bytes32[] storage taps = _userTaps[_user];
         for (uint256 i; i < taps.length; i++) {
@@ -692,11 +739,14 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Listener
     // ──────────────────────────────────────────────
 
+    /// @dev Set the schedule listener (receives callbacks on tap/revoke/lapse).
     function _setListener(address _listener) internal {
         scheduleListener = _listener;
         emit ListenerSet(_listener);
     }
 
+    /// @dev Best-effort callback to the listener. Silently swallows reverts so
+    ///      a broken listener can't block core operations.
     function _notifyListener(address _user, bool _active) internal {
         address listener = scheduleListener;
         if (listener == address(0)) return;
