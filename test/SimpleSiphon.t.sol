@@ -5,6 +5,8 @@ import {SimpleSiphon} from "../src/example/SimpleSiphon.sol";
 import {StreamingSubscription} from "../src/example/StreamingSubscription.sol";
 import {Payroll} from "../src/example/Payroll.sol";
 import {RentalAgreement} from "../src/example/RentalAgreement.sol";
+import {Timeshare} from "../src/example/Timeshare.sol";
+import {TimeshareEscrow} from "../src/example/TimeshareEscrow.sol";
 import {SiphonToken} from "../src/SiphonToken.sol";
 import {IScheduleListener} from "../src/interfaces/IScheduleListener.sol";
 import {Test} from "forge-std/Test.sol";
@@ -1802,5 +1804,645 @@ contract RentalAgreementTest is Test {
 
         (,uint32 endDay,,) = rental.leases(tenant1);
         assertEq(endDay, 1365);
+    }
+}
+
+// ================================================================
+//  Timeshare tests
+// ================================================================
+
+contract TimeshareTest is Test {
+    SimpleSiphon public token;
+    Timeshare public ts;
+
+    address owner_  = makeAddr("owner");
+    address tsOwner = makeAddr("tsOwner");
+    address alice   = makeAddr("alice");
+    address bob     = makeAddr("bob");
+    address carol   = makeAddr("carol");
+    address dave    = makeAddr("dave");
+
+    uint128 constant RATE             = 3000 ether;
+    uint16  constant TERMS_PER_SEASON = 12;
+    uint16  constant DEADLINE_DAYS    = 30;
+    uint256 constant DAY              = 86_400;
+    // share = 3000 * 12 / 4 = 9000
+    uint128 constant SHARE            = 9000 ether;
+
+    function setUp() public {
+        vm.warp(1000 * DAY);
+        token = new SimpleSiphon(owner_);
+        ts = new Timeshare(address(token), tsOwner);
+
+        vm.startPrank(owner_);
+        token.setScheduler(owner_);
+        token.setSpender(owner_);
+        vm.stopPrank();
+    }
+
+    // -- Helpers --
+
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
+
+    function _mint(address user, uint128 amt) internal {
+        vm.prank(owner_);
+        token.mint(user, amt);
+    }
+
+    function _mid(address beneficiary, uint128 rate) internal pure returns (bytes32) {
+        return keccak256(abi.encode(beneficiary, rate));
+    }
+
+    function _defaultMembers() internal view returns (address[] memory) {
+        address[] memory m = new address[](4);
+        m[0] = alice; m[1] = bob; m[2] = carol; m[3] = dave;
+        return m;
+    }
+
+    function _createDefault() internal returns (uint256 agreementId) {
+        vm.prank(tsOwner);
+        agreementId = ts.create(RATE, TERMS_PER_SEASON, DEADLINE_DAYS, _defaultMembers());
+    }
+
+    function _fundMember(uint256 agreementId, address member) internal {
+        vm.prank(member);
+        token.approve(address(ts), SHARE);
+        vm.prank(member);
+        ts.fund(agreementId);
+    }
+
+    function _fundAll(uint256 agreementId) internal {
+        address[] memory m = _defaultMembers();
+        for (uint256 i; i < m.length; i++) {
+            _mint(m[i], SHARE);
+            _fundMember(agreementId, m[i]);
+        }
+    }
+
+    // ================================================================
+    //  1. Create
+    // ================================================================
+
+    function test_Timeshare__create_deploysEscrowAndStoresAgreement() public {
+        uint256 id = _createDefault();
+        assertEq(id, 1);
+
+        (
+            address escrow, uint128 rate, uint16 termsPerSeason,
+            uint8 memberCount, uint8 fundedCount, uint32 activatedDay,
+            uint32 fundingStartDay, uint16 fundingDeadlineDays,
+            uint8 season, bool active
+        ) = ts.agreements(id);
+
+        assertTrue(escrow != address(0));
+        assertEq(rate, RATE);
+        assertEq(termsPerSeason, TERMS_PER_SEASON);
+        assertEq(memberCount, 4);
+        assertEq(fundedCount, 0);
+        assertEq(activatedDay, 0);
+        assertEq(fundingStartDay, 1000);
+        assertEq(fundingDeadlineDays, DEADLINE_DAYS);
+        assertEq(season, 0);
+        assertFalse(active);
+
+        // Escrow metadata
+        TimeshareEscrow escrowContract = TimeshareEscrow(escrow);
+        assertEq(escrowContract.rate(), RATE);
+        assertEq(escrowContract.termsPerSeason(), TERMS_PER_SEASON);
+        assertEq(escrowContract.memberCount(), 4);
+        assertTrue(escrowContract.initialized());
+        assertEq(escrowContract.totalRequired(), RATE * TERMS_PER_SEASON);
+        assertEq(escrowContract.sharePerMember(), SHARE);
+    }
+
+    function test_Timeshare__create_storesMembers() public {
+        uint256 id = _createDefault();
+        address[] memory m = ts.getMembers(id);
+        assertEq(m.length, 4);
+        assertEq(m[0], alice);
+        assertEq(m[1], bob);
+        assertEq(m[2], carol);
+        assertEq(m[3], dave);
+    }
+
+    function test_Timeshare__create_revertsIfNotOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.Unauthorized.selector);
+        ts.create(RATE, TERMS_PER_SEASON, DEADLINE_DAYS, _defaultMembers());
+    }
+
+    function test_Timeshare__create_revertsIfNotDivisible() public {
+        // 3000 * 12 = 36000. 36000 % 7 != 0
+        address[] memory m = new address[](7);
+        for (uint256 i; i < 7; i++) m[i] = address(uint160(0xAA00 + i));
+
+        vm.prank(tsOwner);
+        vm.expectRevert(Timeshare.DivisibilityRequired.selector);
+        ts.create(RATE, TERMS_PER_SEASON, DEADLINE_DAYS, m);
+    }
+
+    function test_Timeshare__create_revertsIfTooFewMembers() public {
+        address[] memory m = new address[](1);
+        m[0] = alice;
+
+        vm.prank(tsOwner);
+        vm.expectRevert(Timeshare.InvalidParams.selector);
+        ts.create(RATE, TERMS_PER_SEASON, DEADLINE_DAYS, m);
+    }
+
+    // ================================================================
+    //  2. Fund + Activate
+    // ================================================================
+
+    function test_Timeshare__fund_allMembersFundAndActivates() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        (address escrow,,,,,,,,uint8 season, bool active) = ts.agreements(id);
+        assertTrue(active);
+        assertEq(season, 1);
+
+        // Escrow was tapped: immediate payment of RATE to Timeshare
+        assertEq(token.balanceOf(address(ts)), RATE);
+        // Escrow balance: total deposited - immediate = RATE * (TERMS_PER_SEASON - 1)
+        assertEq(token.balanceOf(escrow), uint256(RATE) * (TERMS_PER_SEASON - 1));
+
+        // Tap is active
+        bytes32 mid = _mid(address(ts), RATE);
+        assertTrue(token.isTapActive(escrow, mid));
+    }
+
+    function test_Timeshare__fund_revertsIfNonMember() public {
+        uint256 id = _createDefault();
+        address outsider = makeAddr("outsider");
+        _mint(outsider, SHARE);
+
+        vm.prank(outsider);
+        vm.expectRevert(Timeshare.NotMember.selector);
+        ts.fund(id);
+    }
+
+    function test_Timeshare__fund_revertsIfAlreadyFunded() public {
+        uint256 id = _createDefault();
+        _mint(alice, SHARE * 2);
+        _fundMember(id, alice);
+
+        vm.prank(alice);
+        token.approve(address(ts), SHARE);
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.AlreadyFunded.selector);
+        ts.fund(id);
+    }
+
+    function test_Timeshare__fund_partialDoesNotActivate() public {
+        uint256 id = _createDefault();
+        _mint(alice, SHARE);
+        _fundMember(id, alice);
+
+        (,,,,uint8 fundedCount,,,,,bool active) = ts.agreements(id);
+        assertEq(fundedCount, 1);
+        assertFalse(active);
+    }
+
+    // ================================================================
+    //  3. Escrow balance drains
+    // ================================================================
+
+    function test_Timeshare__escrowBalance_drainsCorrectlyOverTime() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        // After 1 term
+        _advanceDays(30);
+        assertEq(token.balanceOf(escrow), uint256(RATE) * (TERMS_PER_SEASON - 2));
+
+        // After full season (12 terms from anchor)
+        _advanceDays(30 * (TERMS_PER_SEASON - 2)); // 10 more terms
+        assertEq(token.balanceOf(escrow), 0);
+    }
+
+    // ================================================================
+    //  4. Harvest
+    // ================================================================
+
+    function test_Timeshare__harvest_collectsCorrectRevenue() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        _advanceDays(90); // 3 terms
+
+        uint256 preBal = token.balanceOf(address(ts));
+        ts.harvest(RATE, 10);
+        uint256 postBal = token.balanceOf(address(ts));
+
+        // Immediate payment already gave RATE. Harvest collects 3 more epochs.
+        assertEq(postBal - preBal, uint256(RATE) * 3);
+    }
+
+    // ================================================================
+    //  5. Access rotation
+    // ================================================================
+
+    function test_Timeshare__hasAccess_roundRobinRotation() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        // Term 0: alice
+        (bool active0, address m0) = ts.hasAccess(id);
+        assertTrue(active0);
+        assertEq(m0, alice);
+
+        // Term 1: bob
+        _advanceDays(30);
+        (, address m1) = ts.hasAccess(id);
+        assertEq(m1, bob);
+
+        // Term 2: carol
+        _advanceDays(30);
+        (, address m2) = ts.hasAccess(id);
+        assertEq(m2, carol);
+
+        // Term 3: dave
+        _advanceDays(30);
+        (, address m3) = ts.hasAccess(id);
+        assertEq(m3, dave);
+
+        // Term 4: alice again
+        _advanceDays(30);
+        (, address m4) = ts.hasAccess(id);
+        assertEq(m4, alice);
+    }
+
+    function test_Timeshare__hasAccess_falseWhenNotActive() public {
+        uint256 id = _createDefault();
+        (bool active,) = ts.hasAccess(id);
+        assertFalse(active);
+    }
+
+    function test_Timeshare__memberHasAccess_correctForSpecificMember() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        assertTrue(ts.memberHasAccess(id, alice));
+        assertFalse(ts.memberHasAccess(id, bob));
+
+        _advanceDays(30);
+        assertFalse(ts.memberHasAccess(id, alice));
+        assertTrue(ts.memberHasAccess(id, bob));
+    }
+
+    // ================================================================
+    //  6. Renew
+    // ================================================================
+
+    function test_Timeshare__renew_seasonEndsAndMembersReFund() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        // Advance full season + 1 term to trigger lapse
+        _advanceDays(30 * (TERMS_PER_SEASON + 1));
+
+        // Settle to finalize lapse
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+        token.settle(escrow);
+
+        ts.renew(id);
+
+        (,,,,uint8 fundedCount,,,,uint8 season, bool active) = ts.agreements(id);
+        assertEq(fundedCount, 0);
+        assertFalse(active);
+        assertEq(season, 1); // still 1 from first activation; renew doesn't increment
+
+        // Fund again
+        _fundAll(id);
+
+        (,,,,,,,,uint8 newSeason, bool newActive) = ts.agreements(id);
+        assertTrue(newActive);
+        assertEq(newSeason, 2);
+    }
+
+    function test_Timeshare__renew_revertsIfStillActive() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        vm.expectRevert(Timeshare.StillActive.selector);
+        ts.renew(id);
+    }
+
+    function test_Timeshare__renew_revertsIfNoSeason() public {
+        uint256 id = _createDefault();
+        vm.expectRevert(Timeshare.NoSeason.selector);
+        ts.renew(id);
+    }
+
+    // ================================================================
+    //  7. Reclaim funding
+    // ================================================================
+
+    function test_Timeshare__reclaimFunding_partialFundingDeadlinePassed() public {
+        uint256 id = _createDefault();
+
+        // Only alice and bob fund
+        _mint(alice, SHARE);
+        _fundMember(id, alice);
+        _mint(bob, SHARE);
+        _fundMember(id, bob);
+
+        // Advance past deadline
+        _advanceDays(DEADLINE_DAYS);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.prank(alice);
+        ts.reclaimFunding(id);
+        assertEq(token.balanceOf(alice) - aliceBefore, SHARE);
+
+        assertTrue(ts.isFunded(id, bob));
+        assertFalse(ts.isFunded(id, alice));
+    }
+
+    function test_Timeshare__reclaimFunding_revertsIfDeadlineNotPassed() public {
+        uint256 id = _createDefault();
+        _mint(alice, SHARE);
+        _fundMember(id, alice);
+
+        _advanceDays(DEADLINE_DAYS - 1);
+
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.FundingOpen.selector);
+        ts.reclaimFunding(id);
+    }
+
+    function test_Timeshare__reclaimFunding_revertsIfNotFunded() public {
+        uint256 id = _createDefault();
+        _advanceDays(DEADLINE_DAYS);
+
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.NothingToReclaim.selector);
+        ts.reclaimFunding(id);
+    }
+
+    // ================================================================
+    //  8. Comp
+    // ================================================================
+
+    function test_Timeshare__comp_pausesBillingAndAccess() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        vm.prank(tsOwner);
+        ts.comp(id, 1);
+
+        // During comp: no access
+        (bool active,) = ts.hasAccess(id);
+        assertFalse(active);
+
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+        assertTrue(token.isComped(escrow));
+
+        // After comp ends: access resumes. termIndex = (1030-1000)/30 = 1 => bob
+        _advanceDays(30);
+        (bool activeAfter, address memberAfter) = ts.hasAccess(id);
+        assertTrue(activeAfter);
+        assertEq(memberAfter, bob); // term 1 (comp shifted billing, not rotation)
+    }
+
+    function test_Timeshare__comp_revertsIfNotOwner() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.Unauthorized.selector);
+        ts.comp(id, 1);
+    }
+
+    // ================================================================
+    //  9. Multiple agreements, same rate
+    // ================================================================
+
+    function test_Timeshare__multipleAgreementsSameRate_sharedHarvest() public {
+        // Two agreements at the same rate
+        uint256 id1 = _createDefault();
+        _fundAll(id1);
+
+        address[] memory m2 = new address[](2);
+        m2[0] = makeAddr("e1"); m2[1] = makeAddr("e2");
+        vm.prank(tsOwner);
+        // rate * termsPerSeason must be divisible by 2: 3000 * 12 / 2 = 18000. OK.
+        uint256 id2 = ts.create(RATE, TERMS_PER_SEASON, DEADLINE_DAYS, m2);
+
+        uint128 share2 = uint128(uint256(RATE) * TERMS_PER_SEASON / 2);
+        _mint(m2[0], share2);
+        vm.prank(m2[0]); token.approve(address(ts), share2);
+        vm.prank(m2[0]); ts.fund(id2);
+        _mint(m2[1], share2);
+        vm.prank(m2[1]); token.approve(address(ts), share2);
+        vm.prank(m2[1]); ts.fund(id2);
+
+        // Both active now. Immediate payments: 2 * RATE
+        assertEq(token.balanceOf(address(ts)), RATE * 2);
+
+        _advanceDays(30); // 1 term
+        ts.harvest(RATE, 10);
+        // Harvest from 2 escrows at epoch 1: 2 * RATE
+        assertEq(token.balanceOf(address(ts)), RATE * 2 + RATE * 2);
+    }
+
+    // ================================================================
+    //  10. Revoke mid-season
+    // ================================================================
+
+    function test_Timeshare__revokeAgreement_stopsBillingMidSeason() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        _advanceDays(90); // 3 terms
+
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        vm.prank(tsOwner);
+        ts.revokeAgreement(id);
+
+        (,,,,,,,,,bool active) = ts.agreements(id);
+        assertFalse(active);
+
+        // Balance frozen (settle happened during revoke, 3 periods consumed)
+        uint256 balAfter = token.balanceOf(escrow);
+        // After settle: principal - 3*RATE consumed. Then revoke stops drain.
+        // Original: RATE * 11 (after immediate). After 3 periods: RATE * 8.
+        assertEq(balAfter, uint256(RATE) * 8);
+
+        // No further decay
+        _advanceDays(30);
+        assertEq(token.balanceOf(escrow), uint256(RATE) * 8);
+    }
+
+    function test_Timeshare__revokeAgreement_revertsIfNotOwner() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.Unauthorized.selector);
+        ts.revokeAgreement(id);
+    }
+
+    function test_Timeshare__revokeAgreement_revertsIfNotActive() public {
+        uint256 id = _createDefault();
+
+        vm.prank(tsOwner);
+        vm.expectRevert(Timeshare.NotActive.selector);
+        ts.revokeAgreement(id);
+    }
+
+    // ================================================================
+    //  11. Escrow access control
+    // ================================================================
+
+    function test_Timeshare__escrow_refundRevertsIfNotTimeshare() public {
+        uint256 id = _createDefault();
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        vm.prank(alice);
+        vm.expectRevert(TimeshareEscrow.Unauthorized.selector);
+        TimeshareEscrow(escrow).refund(alice, 100 ether);
+    }
+
+    function test_Timeshare__escrow_setupRevertsIfNotTimeshare() public {
+        uint256 id = _createDefault();
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        vm.prank(alice);
+        vm.expectRevert(TimeshareEscrow.Unauthorized.selector);
+        TimeshareEscrow(escrow).setup(1);
+    }
+
+    function test_Timeshare__escrow_initializeRevertsIfAlreadyInitialized() public {
+        uint256 id = _createDefault();
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        // Even the timeshare can't re-initialize
+        vm.prank(address(ts));
+        vm.expectRevert(TimeshareEscrow.AlreadyInitialized.selector);
+        TimeshareEscrow(escrow).initialize(1000, 6, 2);
+    }
+
+    // ================================================================
+    //  12. Withdraw
+    // ================================================================
+
+    function test_Timeshare__withdraw_sendsTokensToRecipient() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+        // Timeshare has RATE from immediate payment
+
+        vm.prank(tsOwner);
+        ts.withdraw(tsOwner, RATE);
+        assertEq(token.balanceOf(tsOwner), RATE);
+        assertEq(token.balanceOf(address(ts)), 0);
+    }
+
+    function test_Timeshare__withdraw_revertsIfNotOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(Timeshare.Unauthorized.selector);
+        ts.withdraw(alice, 100 ether);
+    }
+
+    // ================================================================
+    //  13. MandateId consistency (avoid RentalAgreement bug)
+    // ================================================================
+
+    function test_Timeshare__mandateId_matchesBetweenTimeshareAndEscrow() public {
+        uint256 id = _createDefault();
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        // The escrow's mandateId view should match what Timeshare uses
+        bytes32 escrowMid = TimeshareEscrow(escrow).mandateId();
+        bytes32 expected = _mid(address(ts), RATE);
+        assertEq(escrowMid, expected);
+
+        // After activation, the tap should be at this mandateId
+        _fundAll(id);
+        assertTrue(token.isTapActive(escrow, expected));
+    }
+
+    // ================================================================
+    //  14. Full lifecycle: create, fund, drain, renew, re-fund
+    // ================================================================
+
+    function test_Timeshare__lifecycle_createFundDrainRenew() public {
+        uint256 id = _createDefault();
+
+        // Season 1: fund and activate
+        _fundAll(id);
+        assertTrue(ts.memberHasAccess(id, alice));
+
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+
+        // Drain full season
+        _advanceDays(30 * TERMS_PER_SEASON);
+        assertEq(token.balanceOf(escrow), 0);
+
+        // Harvest all revenue
+        ts.harvest(RATE, 20);
+        // Total: RATE (immediate) + 11 epochs harvested (entry at epoch 1, exit at epoch 12)
+        assertEq(token.balanceOf(address(ts)), uint256(RATE) * TERMS_PER_SEASON);
+
+        // Lapse: advance 1 more term past funded
+        _advanceDays(30);
+        token.settle(escrow);
+
+        // Season 2: renew and re-fund
+        ts.renew(id);
+        _fundAll(id);
+
+        (,,,,,,,,uint8 season, bool active) = ts.agreements(id);
+        assertEq(season, 2);
+        assertTrue(active);
+
+        // Access resumes
+        assertTrue(ts.memberHasAccess(id, alice));
+    }
+
+    // ================================================================
+    //  15. Renew refunds leftover after mid-season revoke
+    // ================================================================
+
+    function test_Timeshare__renew_refundsLeftoverAfterRevoke() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        // Revoke after 3 terms
+        _advanceDays(90);
+        vm.prank(tsOwner);
+        ts.revokeAgreement(id);
+
+        (address escrow,,,,,,,,,) = ts.agreements(id);
+        uint256 leftover = token.balanceOf(escrow);
+        assertTrue(leftover > 0);
+
+        // Track member balances before renew
+        uint256 aliceBefore = token.balanceOf(alice);
+
+        ts.renew(id);
+
+        // Each member gets leftover / 4
+        uint256 perMember = leftover / 4;
+        assertEq(token.balanceOf(alice) - aliceBefore, perMember);
+    }
+
+    // ================================================================
+    //  16. hasAccess returns false after season ends
+    // ================================================================
+
+    function test_Timeshare__hasAccess_falseAfterSeasonEnds() public {
+        uint256 id = _createDefault();
+        _fundAll(id);
+
+        // Advance past termsPerSeason
+        _advanceDays(30 * TERMS_PER_SEASON);
+
+        (bool active,) = ts.hasAccess(id);
+        assertFalse(active);
     }
 }
