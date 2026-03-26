@@ -30,7 +30,9 @@ The beneficiary role is permissionless; anyone can call `tap()` if the user auth
 
 Harvest cost scales linearly with neglect. Monthly harvest = 1 epoch, trivial. Skip 6 months = 6 iterations. It never bricks. Anyone can call `harvest()` on any mandate; tokens always go to the beneficiary.
 
-**Sponsorship.** Anyone can sponsor tokens for a specific user's specific mandate. Sponsored tokens are locked; they can't be transferred or withdrawn. They get consumed before the user's own principal. A sponsored mandate can survive past the point where the user's own balance runs out. This is how "3 months free" works without pausing or modifying the mandate.
+**Comp.** The beneficiary can comp a user: pause billing for N terms. The user's balance freezes; no payments are deducted. When the comp period ends, billing resumes automatically. No re-authorization needed. The beneficiary calls `comp(user, rate, epochs)` and the token moves the user's billing anchor forward. The service contract tracks "this user is comped" for its own access gating. This is how "3 months free" works.
+
+**Sponsorship.** Anyone can sponsor tokens for a specific user's specific mandate. Sponsored tokens are locked; they can't be transferred or withdrawn. They get consumed before the user's own principal. A sponsored mandate can survive past the point where the user's own balance runs out. Use sponsorship to extend a mandate's runway (more months before lapse), not for free months (use comp for that).
 
 **Priority.** When a user's balance can't cover all active mandates, they're resolved in tap order (first-tapped = first-paid). Higher-priority mandates survive; lower-priority ones lapse. Sponsored mandates can survive independently since they have their own funding.
 
@@ -63,8 +65,11 @@ constructor() SiphonToken(0, 30, 32) {}
                  No transaction, no event, no gas. Just math and time.)
 4. Beneficiary: token.harvest(beneficiary, rate, maxEpochs)
    ; walks epochs, counts active subscribers, collects income
-5. Lapse:       funds exhausted; mandate cleared on next interaction
-6. Renewal:     user re-authorizes, beneficiary re-taps
+5. Comp:        token.comp(user, rate, epochs)     [optional]
+   ; beneficiary pauses billing for N terms; balance freezes
+   ; billing resumes automatically; no re-auth needed
+6. Lapse:       funds exhausted; mandate cleared on next interaction
+7. Renewal:     user re-authorizes, beneficiary re-taps
 ```
 
 ## Implementing a service
@@ -109,11 +114,10 @@ contract StreamingSubscription {
         userPlan[msg.sender] = _newPlanId;
     }
 
-    // Gift 3 months free
-    function sponsorTrial(address _user, uint256 _planId, uint8 _months) external {
+    // Gift 3 months free (billing pauses, resumes automatically)
+    function comp(address _user, uint256 _planId, uint16 _months) external onlyOwner {
         Plan storage plan = plans[_planId];
-        bytes32 mid = token.mandateId(address(this), plan.rate);
-        token.sponsor(_user, mid, plan.rate * uint128(_months));
+        token.comp(_user, plan.rate, _months);
     }
 
     // Collect revenue
@@ -145,6 +149,9 @@ token.isActive(user)
 
 // whether a specific mandate is active
 token.isTapActive(user, mid)
+
+// whether user is in a comp period (billing paused)
+token.isComped(user)
 
 // compute a mandateId
 token.mandateId(beneficiary, rate)

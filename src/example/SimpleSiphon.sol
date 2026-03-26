@@ -39,4 +39,8 @@ contract SimpleSiphon is SiphonToken {
     }
 
     function spend(address _user, uint128 _amount) external onlySpender { _spend(_user, _amount); }
+
+    function compUser(address _user, bytes32 _mid, uint16 _epochs) external onlyScheduler {
+        _comp(_user, _mid, _epochs);
+    }
 }

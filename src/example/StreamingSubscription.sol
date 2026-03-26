@@ -91,10 +91,20 @@ contract StreamingSubscription {
         userPlan[msg.sender] = 0;
     }
 
+    // ── Comp (free months) ──
+
+    /// @notice Give a user N free months. Billing pauses; resumes
+    ///         automatically when the comp period ends. No tokens move.
+    function comp(address _user, uint256 _planId, uint16 _months) external onlyOwner {
+        Plan storage plan = plans[_planId];
+        if (plan.rate == 0) revert InvalidPlan();
+        token.comp(_user, plan.rate, _months);
+    }
+
     // ── Sponsored trial ──
 
-    /// @notice Gift a user N months of a plan. Sponsor tokens are locked to
-    ///         their mandate and consumed before the user's own balance.
+    /// @notice Sponsor tokens for a user's mandate. Locked and consumed
+    ///         before the user's own balance (extends runway, not free months).
     function sponsorTrial(address _user, uint256 _planId, uint8 _months) external {
         Plan storage plan = plans[_planId];
         if (plan.rate == 0) revert InvalidPlan();

@@ -64,6 +64,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     error MaxTaps();
     error TapNotFound();
     error NotActive();
+    error AlreadyComped();
 
     // ──────────────────────────────────────────────
     // Events
@@ -77,6 +78,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     event Siphoned(address indexed from, address indexed to, uint256 amount);
     event Spent(address indexed user, uint256 amount);
     event Harvested(address indexed beneficiary, bytes32 indexed mandateId, uint256 amount, uint256 epochs);
+    event Comped(address indexed user, bytes32 indexed mandateId, uint16 epochs);
     event ListenerSet(address listener);
 
     // ──────────────────────────────────────────────
@@ -263,6 +265,11 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return (cp.lastEpoch, cp.count);
     }
 
+    /// @notice True if the user is in a comp period (anchor is in the future).
+    function isComped(address _user) external view returns (bool) {
+        return _today() < uint256(_anchor[_user]);
+    }
+
     // ──────────────────────────────────────────────
     // Public: Settle
     // ──────────────────────────────────────────────
@@ -358,6 +365,19 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         emit Transfer(msg.sender, address(this), _amount);
         emit Sponsored(_user, _mid, _amount);
+    }
+
+    // ──────────────────────────────────────────────
+    // Public: Comp (beneficiary pauses billing)
+    // ──────────────────────────────────────────────
+
+    /// @notice Comp a user: pause billing for N terms. Caller must be the
+    ///         mandate's beneficiary. The user's balance freezes; billing
+    ///         resumes automatically when the comp period ends.
+    ///         NOTE: Anchor is shared. This pauses ALL of the user's mandates.
+    function comp(address _user, uint128 _rate, uint16 _epochs) external virtual {
+        bytes32 mid = _mandateId(msg.sender, _rate);
+        _comp(_user, mid, _epochs);
     }
 
     // ──────────────────────────────────────────────
@@ -481,6 +501,45 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (_userTaps[_user].length == 0) _notifyListener(_user, false);
     }
 
+    /// @dev Comp: pause billing for N terms by moving anchor forward.
+    ///      Updates bucket entries/exits for all non-burn taps so
+    ///      beneficiaries only harvest for periods actually billed.
+    function _comp(address _user, bytes32 _mid, uint16 _epochs) internal {
+        Tap storage t = _taps[_user][_mid];
+        if (t.rate == 0) revert TapNotFound();
+        if (t.revokedAt > 0) revert NotActive();
+        if (_epochs == 0) revert InvalidMandate();
+        if (_today() < uint256(_anchor[_user])) revert AlreadyComped();
+
+        _settle(_user);
+
+        uint256 curEpoch = _epochOf();
+        uint256 compDays = uint256(_epochs) * uint256(TERM_DAYS);
+        uint256 newAnchorDay = _today() + compDays;
+        uint256 anchorEpoch = (newAnchorDay - uint256(DEPLOY_DAY)) / uint256(TERM_DAYS);
+
+        // Update bucket entries for all non-burn taps: exit now, re-enter after comp
+        bytes32[] storage uTaps = _userTaps[_user];
+        for (uint256 i; i < uTaps.length; i++) {
+            bytes32 tapMid = uTaps[i];
+            Tap storage tap = _taps[_user][tapMid];
+            bool isBurn = _mandateId(address(0), tap.rate) == tapMid;
+            if (isBurn) continue;
+
+            _exits[tapMid][curEpoch + 1]++;
+            tap.entryEpoch = uint32(anchorEpoch + 1);
+            _entries[tapMid][anchorEpoch + 1]++;
+        }
+
+        // Move anchor forward (freezes balance for all mandates)
+        _anchor[_user] = uint32(newAnchorDay);
+
+        // Recompute exits with new anchor
+        _recomputeAllExits(_user);
+
+        emit Comped(_user, _mid, _epochs);
+    }
+
     // ──────────────────────────────────────────────
     // Internal: Lazy Math
     // ──────────────────────────────────────────────
@@ -529,6 +588,14 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint256 today = _today();
         if (today <= uint256(DEPLOY_DAY)) return 0;
         return (today - uint256(DEPLOY_DAY)) / uint256(TERM_DAYS);
+    }
+
+    /// @dev Convert a user's anchor to an epoch index. Used for exit
+    ///      computation so exits are relative to billing start, not wall clock.
+    function _anchorEpoch(address _user) internal view returns (uint256) {
+        uint32 anch = _anchor[_user];
+        if (uint256(anch) <= uint256(DEPLOY_DAY)) return 0;
+        return (uint256(anch) - uint256(DEPLOY_DAY)) / uint256(TERM_DAYS);
     }
 
     // ──────────────────────────────────────────────
@@ -624,7 +691,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function _recomputeAllExits(address _user) internal {
         Account storage a = _accounts[_user];
         bytes32[] storage taps = _userTaps[_user];
-        uint256 curEpoch = _epochOf();
+        uint256 baseEpoch = _anchorEpoch(_user);
         uint256 sharedFunded = _funded(a);
 
         for (uint256 i; i < taps.length; i++) {
@@ -633,7 +700,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
             if (isBurn) continue;
 
             uint256 extraFunded = _sponsored[_user][mid] / uint256(_taps[_user][mid].rate);
-            uint256 newExit = curEpoch + 1 + sharedFunded + extraFunded;
+            uint256 newExit = baseEpoch + 1 + sharedFunded + extraFunded;
             uint32 oldExit = _mandateExitEpoch[_user][mid];
 
             if (uint256(oldExit) != newExit) {
@@ -649,10 +716,10 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         if (isBurn) return;
 
         Account storage a = _accounts[_user];
-        uint256 curEpoch = _epochOf();
+        uint256 baseEpoch = _anchorEpoch(_user);
         uint256 sharedFunded = _funded(a);
         uint256 extraFunded = _sponsored[_user][_mid] / uint256(_taps[_user][_mid].rate);
-        uint256 newExit = curEpoch + 1 + sharedFunded + extraFunded;
+        uint256 newExit = baseEpoch + 1 + sharedFunded + extraFunded;
         uint32 oldExit = _mandateExitEpoch[_user][_mid];
 
         if (uint256(oldExit) != newExit) {
