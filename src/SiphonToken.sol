@@ -299,7 +299,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /// @notice Revoke a mandate. Callable by the user or the mandate's beneficiary.
-    ///         Service continues through the current paid period, then clears on settle.
+    ///         Immediate termination — billing stops, tap is deleted. Service
+    ///         continuation (if any) is the consumer contract's concern.
     function revoke(address _user, bytes32 _mid) external virtual {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
