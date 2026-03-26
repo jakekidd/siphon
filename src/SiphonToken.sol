@@ -427,6 +427,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
             totalBurned += _rate;
             emit Transfer(_user, address(0), _rate);
         } else {
+            _settle(_beneficiary);
             _accounts[_beneficiary].principal += _rate;
             emit Transfer(_user, _beneficiary, _rate);
         }

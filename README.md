@@ -38,7 +38,7 @@ Harvest cost scales linearly with how many epochs you skip. Monthly harvest = 1 
 
 ## Configuration
 
-Three immutables set at construction. Choose wisely; like a tattoo, they're permanent.
+Three immutables set at construction. Choose wisely; they're permanent.
 
 **`TERM_DAYS`** is the billing interval in days. Every mandate on this token uses the same interval. 30 for monthly billing. 7 for weekly. If you need both monthly and weekly mandates, deploy two separate tokens. This constraint is what keeps `balanceOf` O(1); without it, mandates with different intervals can't share a combined outflow rate.
 

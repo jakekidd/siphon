@@ -16,7 +16,7 @@ contract SimpleSiphon is SiphonToken {
     modifier onlyScheduler() { if (msg.sender != scheduler) revert Unauthorized(); _; }
     modifier onlySpender() { if (msg.sender != spender) revert Unauthorized(); _; }
 
-    constructor(address _owner) SiphonToken(0, 30, 16) {
+    constructor(address _owner) SiphonToken(0, 30, 32) {
         owner = _owner;
     }
 
