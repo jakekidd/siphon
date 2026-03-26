@@ -2,10 +2,17 @@
 
 ## Design decisions
 
-- Unified approval: merge ERC20 approve (transfers) and approveSchedule (assignments) into one system. Simpler but less granular. Deferred.
+- Unified approval: merge ERC20 approve (transfers) and authorize (mandates) into one system. Simpler but less granular. Deferred.
 
 ## Implementation
 
-- Multi-schedule per user
-- ECDSA-signed schedule approvals (permit-style, save a tx)
-- Tests: full rewrite for current API
+- ECDSA-signed mandate authorizations (permit-style, save a tx)
+- Tests: full rewrite for current API + example contracts
+- Delist method for beneficiaries (deactivate a mandate they no longer offer)
+
+## Backlog
+
+- Per-second streaming (Superfluid-style) alongside period-based mandates. Technically possible: add streamRate to Account, compute streamConsumed = elapsed_seconds * ratePerSecond in _balance alongside periodConsumed. But doubles the surface area; two systems competing for same principal creates priority questions. Also: balanceOf updating per-second breaks most frontend/wallet refresh assumptions. Period-based (monthly) fits the natural refresh cadence of wallets and explorers. Streaming micropayments may be fundamentally better as a deposit-into-separate-contract model (like Superfluid) rather than native to the token. Still worth exploring as a future extension; the math is compatible even if the UX is different.
+- Burn-only variant contract (strip beneficiary/bucket machinery, ~40% smaller)
+- Abstract base + interface reorganization (shared base for burn-only and full variants)
+- Direct deposit / paycheck use case documentation (employer is user, employee is beneficiary; already works)
