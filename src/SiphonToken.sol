@@ -409,9 +409,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
     /// @dev Transfer between users. Settles both sides. Recomputes exits for both
     ///      (principal changes affect funded periods and therefore bucket exits).
+    ///      Calls _beforeTransfer hook for implementer-defined restrictions.
     function _transfer(address _from, address _to, uint256 _amount) internal {
         if (_from == address(0)) revert ERC20InvalidSender(address(0));
         if (_to == address(0)) revert ERC20InvalidReceiver(address(0));
+
+        _beforeTransfer(_from, _to, _amount);
 
         _settle(_from);
         if (_balance(_from) < _amount) revert InsufficientBalance();
@@ -424,6 +427,11 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         emit Transfer(_from, _to, _amount);
     }
+
+    /// @dev Hook called before every transfer. Override to add restrictions
+    ///      (e.g. whitelist, pause, exchange regulation). Reverts block the transfer.
+    ///      Default: no-op (open transfers).
+    function _beforeTransfer(address _from, address _to, uint256 _amount) internal virtual {}
 
     /// @dev Tap a user into a mandate. Immediate first-term payment to beneficiary.
     function _tap(address _user, address _beneficiary, uint128 _rate) internal {

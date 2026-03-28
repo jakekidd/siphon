@@ -127,6 +127,19 @@ contract StreamingSubscription {
 
 The key pattern: the service contract IS the beneficiary (`msg.sender` on `tap()` and the address in `harvest()`). The user authorizes the mandateId which locks in both the beneficiary address and the rate. The service wraps mandates with its own product logic (plans, access gating, upgrades) without the token knowing or caring what the service does.
 
+## Transfer restrictions
+
+Transfers are open by default. Override `_beforeTransfer` to add restrictions:
+
+```solidity
+// Only whitelisted agents can initiate transfers (exchange regulation)
+function _beforeTransfer(address, address, uint256) internal view override {
+    if (!transferAgent[msg.sender]) revert NonTransferable();
+}
+```
+
+This hooks into `_transfer`, which is called by `transfer()` and `transferFrom()`. Protocol internals (tap first-term, settle, harvest) manipulate principals directly and are unaffected. The hook only gates user-initiated ERC20 transfers.
+
 ## Reading state
 
 ```solidity
