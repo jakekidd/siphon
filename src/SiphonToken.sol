@@ -7,7 +7,7 @@ import {IMandateListener} from "./interfaces/IMandateListener.sol";
 
 /**
  * @title SiphonToken: ERC20 with mandate-based autopay
- * @author jakek
+ * @author jakekidd
  *
  * @notice Custom ERC20 (abstract) where balanceOf decays over time according
  *         to payment mandates. Payments happen natively within the token balance
@@ -43,6 +43,16 @@ import {IMandateListener} from "./interfaces/IMandateListener.sol";
  *       11   | _taps                 | mapping(address => mapping => Tap)
  *       12   | _burnOutflow          | mapping(address => uint128)
  *       13   | mandateListener       | address
+ *
+ * @dev Invariants (properties the contract always maintains):
+ *
+ *      1. balanceOf(user) + consumed(user) == account.principal
+ *      2. sum of active tap rates == account.outflow
+ *      3. totalSupply() == totalMinted - totalBurned - totalSpent
+ *      4. A deleted tap (rate == 0) can always be re-tapped with fresh authorization
+ *      5. Bucket entries survive revoke/lapse so beneficiaries can harvest historical income
+ *      6. balanceOf never reverts and never returns a value greater than principal
+ *      7. Comp freezes billing for exactly N * TERM_DAYS days, then resumes without re-auth
  */
 abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
@@ -239,13 +249,13 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return totalMinted - totalBurned - totalSpent;
     }
 
-    /// @notice ERC20 transfer. Settles both sides. Subject to _beforeTransfer hook.
+    /// @notice ERC20 transfer. O(n_from + n_to) where n = active taps per user.
     function transfer(address _to, uint256 _amount) external virtual returns (bool) {
         _transfer(msg.sender, _to, _amount);
         return true;
     }
 
-    /// @notice ERC20 transferFrom. Settles both sides. Subject to _beforeTransfer hook.
+    /// @notice ERC20 transferFrom. O(n_from + n_to) where n = active taps per user.
     function transferFrom(address _from, address _to, uint256 _amount) external virtual returns (bool) {
         uint256 allowed = _allowances[_from][msg.sender];
         if (allowed != type(uint256).max) {
@@ -273,7 +283,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /**
-     * @notice Pre-authorize a mandate for tap(). Mirrors ERC20 approve/transferFrom.
+     * @notice Pre-authorize a mandate for tap(). O(1). Mirrors ERC20 approve/transferFrom.
      *
      *         Each tap() consumes one authorization. Set _count to type(uint256).max
      *         for infinite authorization (beneficiary can re-tap freely after revoke
@@ -376,7 +386,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Settle
     // ──────────────────────────────────────────────
 
-    /// @notice Trigger lazy settlement for a user. Anyone can call. No-op if
+    /// @notice Trigger lazy settlement for a user. O(1) normally; O(n) on lapse
+    ///         (priority resolution walks active taps). Anyone can call. No-op if
     ///         no periods have elapsed since the last settlement.
     function settle(address _user) external {
         _settle(_user);
@@ -387,7 +398,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /**
-     * @notice Revoke a mandate. Immediate termination.
+     * @notice Revoke a mandate. O(n) where n = user's active taps. Immediate termination.
      *
      *         Callable by the user (revoking their own mandate) or the beneficiary
      *         (canceling service). Beneficiary identity is recovered from the
@@ -417,7 +428,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /**
-     * @notice Tap a user: activate a mandate. msg.sender IS the beneficiary.
+     * @notice Tap a user: activate a mandate. O(n) where n = user's active taps.
+     *         msg.sender IS the beneficiary.
      *
      *         The beneficiary role is permissionless. Anyone can call tap() if
      *         the user authorized their mandateId. The user IS the gate. If your
@@ -453,8 +465,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /**
-     * @notice Harvest income for a mandate. Permissionless; tokens always go to
-     *         the beneficiary regardless of caller.
+     * @notice Harvest income for a mandate. O(e) where e = epochs since last harvest.
+     *         Permissionless; tokens always go to the beneficiary regardless of caller.
      *
      *         Walks the bucket system epoch-by-epoch from the last checkpoint,
      *         tallying entries (new subscribers) and exits (lapsed/revoked),
@@ -515,8 +527,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     /**
-     * @notice Comp a user: pause billing for N terms. Caller must be the
-     *         mandate's beneficiary.
+     * @notice Comp a user: pause billing for N terms. O(n) where n = user's active taps.
+     *         Caller must be the mandate's beneficiary.
      *
      *         The user's balance freezes; no payments are deducted during the
      *         comp period. When it ends, billing resumes automatically. No
