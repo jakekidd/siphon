@@ -12,7 +12,7 @@ import {IMandateListener} from "./interfaces/IMandateListener.sol";
  * @notice Custom ERC20 (abstract) where balanceOf decays over time according
  *         to payment mandates. Payments happen natively within the token balance
  *         without need of external escrow. Users hold tokens which are automatically
- *         deducted each billing term. balanceOf is O(1) — computed from two stored
+ *         deducted each billing term. balanceOf is O(1): computed from two stored
  *         values (principal, outflow) and the clock, with no iteration.
  *
  *         Various callbacks and hooks flexibly accommodate a wide range of use
