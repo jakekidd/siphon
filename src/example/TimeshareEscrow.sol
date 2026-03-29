@@ -4,7 +4,7 @@ pragma solidity ^0.8.23;
 import {SiphonToken} from "../SiphonToken.sol";
 
 /**
- * @title TimeshareEscrow — Per-agreement pool for Timeshare
+ * @title TimeshareEscrow: Per-agreement pool for Timeshare
  * @notice Holds deposited tokens from timeshare members. Gets tapped by the
  *         Timeshare contract (beneficiary). Authorizes the mandate, stores
  *         agreement metadata, and supports refunds.

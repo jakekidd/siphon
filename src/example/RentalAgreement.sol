@@ -4,7 +4,7 @@ pragma solidity ^0.8.23;
 import {SiphonToken} from "../SiphonToken.sol";
 
 /**
- * @title RentalAgreement — Multi-tenant rent collection via SiphonToken
+ * @title RentalAgreement: Multi-tenant rent collection via SiphonToken
  * @notice Demonstrates: one beneficiary (landlord) with many tenants.
  *         Each tenant authorizes a mandate, landlord taps them. Landlord
  *         harvests all rent in one call since all tenants share the same

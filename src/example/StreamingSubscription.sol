@@ -4,7 +4,7 @@ pragma solidity ^0.8.23;
 import {SiphonToken} from "../SiphonToken.sol";
 
 /**
- * @title StreamingSubscription — Subscription service backed by SiphonToken mandates
+ * @title StreamingSubscription: Subscription service backed by SiphonToken mandates
  * @notice Demonstrates: subscribe, upgrade/downgrade plans, comp (free months),
  *         access gating via isTapActive, and harvest. The contract IS the
  *         beneficiary; it taps users and collects payments.

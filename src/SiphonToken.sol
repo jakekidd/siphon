@@ -6,7 +6,7 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 import {IMandateListener} from "./interfaces/IMandateListener.sol";
 
 /**
- * @title SiphonToken — ERC20 with mandate-based autopay
+ * @title SiphonToken: ERC20 with mandate-based autopay
  * @author jakek
  *
  * @notice Custom ERC20 (abstract) where balanceOf decays over time according
@@ -78,7 +78,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
     /// @notice A mandate was activated on a user. Immediate first-term payment deducted.
     event Tapped(address indexed user, bytes32 indexed mandateId, address beneficiary, uint128 rate);
-    /// @notice A mandate was terminated (user- or beneficiary-initiated, or lapse).
+    /// @notice A mandate was terminated (by user, by beneficiary, or by lapse).
     event Revoked(address indexed user, bytes32 indexed mandateId, uint32 day);
     /// @notice Lazy settlement materialized: consumed tokens deducted from principal.
     event Settled(address indexed user, uint256 amount);
@@ -130,11 +130,22 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     uint256 internal constant _SECONDS_PER_DAY = 86_400;
 
     // ──────────────────────────────────────────────
-    // Immutables
+    // Immutables (set once in constructor, stored in bytecode)
     // ──────────────────────────────────────────────
 
+    /// @notice Day index anchoring epoch boundaries. Epoch 0 starts on this day.
+    ///         Pass 0 to use the deployment day. Pass a specific value to align
+    ///         epochs with an external system (e.g. a fiscal calendar).
     uint32 public immutable GENESIS_DAY;
+
+    /// @notice Billing interval in days. Every mandate on this token uses the
+    ///         same interval (30 for monthly, 7 for weekly). If you need mixed
+    ///         intervals, deploy separate tokens. Uniform intervals are what
+    ///         make O(1) balanceOf possible: all taps can share one outflow sum.
     uint16 public immutable TERM_DAYS;
+
+    /// @notice Maximum concurrent mandates per user. Caps the O(n) cost of
+    ///         operations that touch all taps (deposit, spend, transfer).
     uint8 public immutable MAX_TAPS;
 
     // ──────────────────────────────────────────────
@@ -201,6 +212,9 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Constructor
     // ──────────────────────────────────────────────
 
+    /// @param _genesisDay  Epoch anchor day. 0 = use deployment day.
+    /// @param _termDays    Billing interval in days. Must be > 0.
+    /// @param _maxTaps     Max concurrent mandates per user. Must be > 0.
     constructor(uint32 _genesisDay, uint16 _termDays, uint8 _maxTaps) {
         GENESIS_DAY = _genesisDay == 0 ? uint32(block.timestamp / _SECONDS_PER_DAY) : _genesisDay;
         require(_termDays > 0, "term must be > 0");
@@ -219,7 +233,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return _balance(_user);
     }
 
-    /// @notice Total tokens in circulation. Stale between settlements — see Tradeoffs in README.
+    /// @notice Total tokens in circulation. Stale between settlements (see Tradeoffs in README).
     /// @dev Does not reflect unsettled consumption or unharvested beneficiary income.
     function totalSupply() external view returns (uint256) {
         return totalMinted - totalBurned - totalSpent;
@@ -628,7 +642,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         _notifyListener(_user, true);
     }
 
-    /// @dev Revoke a mandate. Immediate termination — the bank stops the payment.
+    /// @dev Revoke a mandate. Immediate termination: the bank stops the payment.
     ///      Bucket entry is preserved so the beneficiary can harvest historical
     ///      epochs. Exit is moved to current epoch to stop future earnings.
     ///      Tap is deleted so the same mandateId can be re-tapped later.
@@ -779,7 +793,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
      *
      *      Idempotent within a term: if no full periods have elapsed since the
      *      last anchor, the function is a no-op. During comp (anchor in the future),
-     *      periodsElapsed returns 0 so settle is also a no-op — the comp anchor
+     *      periodsElapsed returns 0 so settle is also a no-op. The comp anchor
      *      is preserved until it naturally expires.
      *
      *      Called at the start of every mutation (_mint, _spend, _transfer, _tap,

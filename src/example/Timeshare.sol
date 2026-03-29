@@ -5,7 +5,7 @@ import {SiphonToken} from "../SiphonToken.sol";
 import {TimeshareEscrow} from "./TimeshareEscrow.sol";
 
 /**
- * @title Timeshare — Rotating payment responsibility among multiple users
+ * @title Timeshare: Rotating payment responsibility among multiple users
  * @notice Demonstrates: multiple users pooling funds into a shared escrow
  *         that pays a single beneficiary (this contract) via SiphonToken
  *         mandates. Members deposit their share each season; the escrow's

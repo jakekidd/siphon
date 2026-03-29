@@ -177,7 +177,7 @@ token.currentEpoch()
 
 **Subscriptions** (`src/example/StreamingSubscription.sol`). Plans with named tiers, subscribe, upgrade/downgrade (revoke + re-tap), comp (free months), access gating via `isTapActive`, revenue collection per plan. The flagship example; covers the full lifecycle.
 
-**Payroll** (`src/example/Payroll.sol`). Employer holds tokens; employees are beneficiaries at different salary rates. The employer's balance decays as salaries are paid. Employees call `token.tap()` and `token.harvest()` directly. The Payroll contract is bookkeeping — roster management, views, lapse detection via `IMandateListener`. Shows the "one payer, many beneficiaries" pattern with priority (if the company runs low, hire order determines who gets paid first).
+**Payroll** (`src/example/Payroll.sol`). Employer holds tokens; employees are beneficiaries at different salary rates. The employer's balance decays as salaries are paid. Employees call `token.tap()` and `token.harvest()` directly. The Payroll contract is bookkeeping: roster management, views, lapse detection via `IMandateListener`. Shows the "one payer, many beneficiaries" pattern with priority (if the company runs low, hire order determines who gets paid first).
 
 **Rent** (`src/example/RentalAgreement.sol`). One landlord, many tenants, same rent rate. All tenants share the same mandateId (same beneficiary contract + same rate = same hash), so one `harvest()` call collects everyone's rent. Includes security deposit handling, lease terms, delinquency detection, and tenant self-move-out.
 

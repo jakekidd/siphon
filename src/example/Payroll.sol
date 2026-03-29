@@ -5,20 +5,20 @@ import {SiphonToken} from "../SiphonToken.sol";
 import {IMandateListener} from "../interfaces/IMandateListener.sol";
 
 /**
- * @title Payroll — Employer pays employees via SiphonToken mandates
+ * @title Payroll : Employer pays employees via SiphonToken mandates
  * @notice Demonstrates the "one payer, many beneficiaries" pattern.
  *
  *         The employer holds tokens. Each employee is a beneficiary at their
  *         salary rate. The employer's balance decays as salaries are paid.
  *
- *         This contract is bookkeeping only — it tracks the roster and
+ *         This contract is bookkeeping only : it tracks the roster and
  *         provides views. The employer and employees interact with the
  *         token directly for mandate operations:
  *
  *         1. Employer: token.authorize(mandateId(employee, salary), max)
- *         2. Employee: token.tap(employer, salary)   — activates pay
- *         3. Employee: token.harvest(employee, salary, epochs) — collects pay
- *         4. Employer: token.revoke(employer, mandateId)  — terminates pay
+ *         2. Employee: token.tap(employer, salary)   : activates pay
+ *         3. Employee: token.harvest(employee, salary, epochs) : collects pay
+ *         4. Employer: token.revoke(employer, mandateId)  : terminates pay
  *
  *         Uses IMandateListener to detect when payroll funds lapse.
  */

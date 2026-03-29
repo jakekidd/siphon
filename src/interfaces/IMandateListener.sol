@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-/// @title IMandateListener — Callback for SiphonToken mandate state changes
+/// @title IMandateListener: Callback for SiphonToken mandate state changes
 /// @notice Implement this on contracts that need to react when a user's
 ///         mandates change (e.g. subscription managers tracking validity).
 interface IMandateListener {

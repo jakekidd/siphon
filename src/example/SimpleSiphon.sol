@@ -4,7 +4,7 @@ pragma solidity ^0.8.23;
 import {SiphonToken} from "../SiphonToken.sol";
 
 /**
- * @title SimpleSiphon — Example SiphonToken implementation
+ * @title SimpleSiphon: Example SiphonToken implementation
  * @notice Multi-mandate token. TERM_DAYS=30, MAX_TAPS=16. Transfers enabled.
  */
 contract SimpleSiphon is SiphonToken {
