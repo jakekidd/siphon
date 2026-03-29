@@ -7,11 +7,21 @@ import {IMandateListener} from "./interfaces/IMandateListener.sol";
 
 /**
  * @title SiphonToken — ERC20 with mandate-based autopay
- * @author Ubitel
+ * @author jakek
  *
- * @notice Abstract ERC20 where balanceOf decays over time via concurrent
- *         payment mandates. Implementations provide name/symbol/decimals,
- *         access control, and mint/spend entry points.
+ * @notice Custom ERC20 (abstract) where balanceOf decays over time according
+ *         to payment mandates. Payments happen natively within the token balance
+ *         without need of external escrow. Users hold tokens which are automatically
+ *         deducted each billing term. balanceOf is O(1) — computed from two stored
+ *         values (principal, outflow) and the clock, with no iteration.
+ *
+ *         Various callbacks and hooks flexibly accommodate a wide range of use
+ *         cases: _beforeTransfer for transfer restrictions, IMandateListener for
+ *         mandate state change callbacks, and virtual tap/revoke/comp for access
+ *         control overrides.
+ *
+ * @dev Implementations must supply name/symbol/decimals, access control,
+ *      and mint/spend entry points.
  *
  * @dev Storage layout (14 declared state variables, base slots 0-13).
  *      Inheritors should start their own state at slot 14+.
