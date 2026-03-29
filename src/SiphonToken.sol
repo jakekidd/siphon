@@ -9,92 +9,103 @@ import {IMandateListener} from "./interfaces/IMandateListener.sol";
  * @title SiphonToken — ERC20 with scheduled payment deductions
  * @author Ubitel
  *
- * @notice ERC20 where balanceOf decays over time via multiple concurrent
- *         payment mandates. Like a bank account with multiple autopays.
+ * @notice Abstract ERC20 where balanceOf decays over time via concurrent
+ *         payment mandates. Implementations provide name/symbol/decimals,
+ *         access control, and mint/spend entry points.
  *
- * @dev Key concepts:
+ * @dev Storage layout (14 base slots, 0-13). Inheritors start at slot 14+.
  *
- *   MULTI-MANDATE
- *     Users can have up to MAX_TAPS active mandates, each paying a different
- *     beneficiary. All mandates share one principal and use the same billing
- *     interval (TERM_DAYS). balanceOf is O(1) via outflow.
- *
- *   BENEFICIARY MODEL
- *     The beneficiary IS the entity that taps users. msg.sender on tap() is
- *     the beneficiary. Users pre-authorize via authorize().
- *     mandateId = keccak256(beneficiary, rate).
- *
- *   BURN PATH
- *     Burn mandates have beneficiary=address(0). Same array, same outflow.
- *     No authorization needed (self-assigned). No bucket ops (no harvest).
- *
- *   COMP
- *     Beneficiary can pause billing for N terms via comp(). Moves the
- *     user's anchor forward; freezes payments, resumes automatically.
- *
- *   PRIORITY
- *     When funds run out, mandates are resolved in tap order (first-tapped
- *     = first-paid). Lower-priority mandates lapse first.
- *
- *   LAZY SETTLEMENT
- *     balanceOf = principal - min(elapsed, principal/outflow) * outflow.
- *     O(1). Storage only changes via _settle on interaction.
- *
- *   STRUCTS
- *     Account: { uint128 principal, uint128 outflow }  [1 slot shared per user]
- *     Tap: { uint128 rate, uint32 entryEpoch, uint32 exitEpoch }  [1 slot per mandate]
+ *       Slot | Variable              | Type
+ *       -----+-----------------------+--------------------------------------
+ *        0   | _accounts             | mapping(address => Account)
+ *        1   | _anchor               | mapping(address => uint32)
+ *        2   | _allowances           | mapping(address => mapping => uint256)
+ *        3   | totalMinted           | uint256
+ *        4   | totalBurned           | uint256
+ *        5   | totalSpent            | uint256
+ *        6   | _authorizations       | mapping(address => mapping => uint256)
+ *        7   | _checkpoints          | mapping(bytes32 => Checkpoint)
+ *        8   | _entries              | mapping(bytes32 => mapping => uint256)
+ *        9   | _exits                | mapping(bytes32 => mapping => uint256)
+ *       10   | _userTaps             | mapping(address => bytes32[])
+ *       11   | _taps                 | mapping(address => mapping => Tap)
+ *       12   | _burnOutflow          | mapping(address => uint128)
+ *       13   | mandateListener       | address
  */
 abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
     // Errors
     // ──────────────────────────────────────────────
 
+    /// @notice Balance too low for the requested operation.
     error InsufficientBalance();
-    /// @notice ERC20 standard (OpenZeppelin ERC20Errors.sol).
+    /// @notice ERC20 allowance too low for transferFrom.
     error InsufficientAllowance();
-    /// @notice ERC20 standard (OpenZeppelin ERC20Errors.sol).
+    /// @notice ERC20: transfer to the zero address.
     error ERC20InvalidReceiver(address receiver);
-    /// @notice ERC20 standard (OpenZeppelin ERC20Errors.sol).
+    /// @notice ERC20: transfer from the zero address.
     error ERC20InvalidSender(address sender);
+    /// @notice Beneficiary cannot equal the user (self-tap).
     error InvalidBeneficiary();
+    /// @notice Rate is zero, or mandate already exists on this user.
     error InvalidMandate();
+    /// @notice No authorization remaining for this mandate.
     error NotApproved();
+    /// @notice Caller is not permitted for this operation.
     error Unauthorized();
+    /// @notice User already has MAX_TAPS active mandates.
     error MaxTaps();
+    /// @notice No active tap found for the given mandateId.
     error TapNotFound();
+    /// @notice User is already in a comp period (anchor in the future).
     error AlreadyComped();
 
     // ──────────────────────────────────────────────
     // Events
     // ──────────────────────────────────────────────
 
+    /// @notice A mandate was activated on a user. Immediate first-term payment deducted.
     event Tapped(address indexed user, bytes32 indexed mandateId, address beneficiary, uint128 rate);
+    /// @notice A mandate was terminated (user- or beneficiary-initiated, or lapse).
     event Revoked(address indexed user, bytes32 indexed mandateId, uint32 day);
+    /// @notice Lazy settlement materialized: consumed tokens deducted from principal.
     event Settled(address indexed user, uint256 amount);
+    /// @notice Mandate authorization set or updated.
     event Authorized(address indexed user, bytes32 indexed mandateId, uint256 count);
+    /// @notice Tokens burned via _spend (marketplace purchases, fees, etc.).
     event Spent(address indexed user, uint256 amount);
+    /// @notice Beneficiary collected income from the bucket system.
     event Harvested(address indexed beneficiary, bytes32 indexed mandateId, uint256 amount, uint256 epochs);
+    /// @notice Billing paused for N terms on a user.
     event Comped(address indexed user, bytes32 indexed mandateId, uint16 epochs);
+    /// @notice Mandate listener address updated.
     event ListenerSet(address listener);
 
     // ──────────────────────────────────────────────
     // Structs
     // ──────────────────────────────────────────────
 
-    /// @dev Shared per user. 1 storage slot.
+    /// @notice Per-user account. Packed into 1 storage slot (256 bits).
+    /// @dev principal: stored token balance (before lazy deductions).
+    ///      outflow: sum of all active tap rates. balanceOf = principal - consumed(outflow).
     struct Account {
         uint128 principal;
         uint128 outflow;
     }
 
-    /// @dev Per user per mandateId. 1 storage slot (192 bits used, 64 free).
+    /// @notice Per-user per-mandate tap record. Packed into 1 storage slot (192/256 bits).
+    /// @dev rate: tokens per term paid to the beneficiary.
+    ///      entryEpoch: epoch when this tap entered the bucket system.
+    ///      exitEpoch: projected epoch when funds run out (updated on principal/outflow changes).
     struct Tap {
         uint128 rate;
         uint32 entryEpoch;
         uint32 exitEpoch;
     }
 
-    /// @dev Collection checkpoint per mandateId. 1 storage slot.
+    /// @notice Harvest checkpoint per mandateId. Packed into 1 storage slot (256 bits).
+    /// @dev lastEpoch: last epoch processed by harvest().
+    ///      count: running number of active subscribers at lastEpoch.
     struct Checkpoint {
         uint32 lastEpoch;
         uint224 count;
@@ -115,28 +126,63 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     uint8 public immutable MAX_TAPS;
 
     // ──────────────────────────────────────────────
-    // State
+    // State (slots 0-13)
     // ──────────────────────────────────────────────
 
+    /// @notice Per-user account: principal balance and aggregate outflow rate.
+    /// @dev Slot 0.
     mapping(address => Account) internal _accounts;
+
+    /// @notice Per-user billing anchor (day index). Periods elapsed = (today - anchor) / TERM_DAYS.
+    /// @dev Slot 1. Shared across all mandates. Reset on settle, tap, revoke. Moved forward on comp.
     mapping(address => uint32) internal _anchor;
+
+    /// @notice ERC20 allowances.
+    /// @dev Slot 2.
     mapping(address => mapping(address => uint256)) internal _allowances;
 
+    /// @notice Cumulative tokens ever minted.
+    /// @dev Slot 3. totalSupply = totalMinted - totalBurned - totalSpent.
     uint256 public totalMinted;
+
+    /// @notice Cumulative tokens destroyed by burn mandates (beneficiary = address(0)).
+    /// @dev Slot 4.
     uint256 public totalBurned;
+
+    /// @notice Cumulative tokens removed via _spend (marketplace purchases, fees).
+    /// @dev Slot 5.
     uint256 public totalSpent;
 
+    /// @notice Per-user mandate authorizations. authorize(mid, count) sets; tap() decrements.
+    /// @dev Slot 6. type(uint256).max = infinite (never decremented).
     mapping(address => mapping(bytes32 => uint256)) internal _authorizations;
+
+    /// @notice Per-mandate harvest checkpoint: last epoch processed and running subscriber count.
+    /// @dev Slot 7.
     mapping(bytes32 => Checkpoint) internal _checkpoints;
+
+    /// @notice Bucket entries: _entries[mandateId][epoch] = number of users entering at that epoch.
+    /// @dev Slot 8. Written on tap and comp re-entry. Deleted during harvest.
     mapping(bytes32 => mapping(uint256 => uint256)) internal _entries;
+
+    /// @notice Bucket exits: _exits[mandateId][epoch] = number of users exiting at that epoch.
+    /// @dev Slot 9. Recomputed on principal/outflow changes. Deleted during harvest.
     mapping(bytes32 => mapping(uint256 => uint256)) internal _exits;
 
+    /// @notice Ordered list of active mandateIds per user. Index = priority (0 = highest).
+    /// @dev Slot 10. Array order determines lapse priority: first-tapped = first-paid.
     mapping(address => bytes32[]) internal _userTaps;
+
+    /// @notice Per-user per-mandate tap records.
+    /// @dev Slot 11. Deleted on revoke/lapse (same mandateId can be re-tapped).
     mapping(address => mapping(bytes32 => Tap)) internal _taps;
 
-    /// @dev Per-user burn outflow (subset of outflow that's burn mandates).
+    /// @notice Per-user burn outflow: subset of outflow from burn mandates (beneficiary = address(0)).
+    /// @dev Slot 12. Tracked separately so _settle can attribute burns to totalBurned.
     mapping(address => uint128) internal _burnOutflow;
 
+    /// @notice External contract notified on mandate state changes (tap, revoke, lapse).
+    /// @dev Slot 13. Best-effort callback; reverts are silently swallowed.
     address public mandateListener;
 
     // ──────────────────────────────────────────────
@@ -192,8 +238,19 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Authorization (mandate approval)
     // ──────────────────────────────────────────────
 
-    /// @notice Pre-authorize a mandate. Each tap() consumes one.
-    ///         type(uint256).max = infinite (beneficiary can re-tap freely).
+    /**
+     * @notice Pre-authorize a mandate for tap(). Mirrors ERC20 approve/transferFrom.
+     *
+     *         Each tap() consumes one authorization. Set _count to type(uint256).max
+     *         for infinite authorization (beneficiary can re-tap freely after revoke
+     *         or lapse, enabling auto-renew flows).
+     *
+     *         The mandateId locks in both the beneficiary address and the rate.
+     *         Changing either requires a new authorization.
+     *
+     * @param _mid    mandateId = keccak256(beneficiary, rate).
+     * @param _count  Number of taps authorized. 0 = revoke authorization.
+     */
     function authorize(bytes32 _mid, uint256 _count) external {
         _authorizations[msg.sender][_mid] = _count;
         emit Authorized(msg.sender, _mid, _count);
@@ -295,9 +352,22 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Revoke (terminate a mandate)
     // ──────────────────────────────────────────────
 
-    /// @notice Revoke a mandate. Callable by the user or the mandate's beneficiary.
-    ///         Immediate termination — billing stops, tap is deleted. Service
-    ///         continuation (if any) is the consumer contract's concern.
+    /**
+     * @notice Revoke a mandate. Immediate termination.
+     *
+     *         Callable by the user (revoking their own mandate) or the beneficiary
+     *         (canceling service). Beneficiary identity is recovered from the
+     *         mandateId hash: mandateId(msg.sender, rate) must equal _mid.
+     *
+     *         On revoke:
+     *         - Outflow decreases; balance stops decaying for this mandate.
+     *         - Bucket exit is moved to the current epoch (stops future harvest earnings).
+     *         - Bucket entry is preserved so the beneficiary can still harvest historical epochs.
+     *         - Tap is deleted: the same mandateId can be re-tapped later if re-authorized.
+     *
+     * @param _user  The user whose mandate is being revoked.
+     * @param _mid   The mandateId to revoke.
+     */
     function revoke(address _user, bytes32 _mid) external virtual {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
@@ -312,8 +382,28 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Tap (beneficiary activates mandate for user)
     // ──────────────────────────────────────────────
 
-    /// @notice Tap a user. msg.sender IS the beneficiary.
-    ///         Consumes one authorization. Immediate first-term payment.
+    /**
+     * @notice Tap a user: activate a mandate. msg.sender IS the beneficiary.
+     *
+     *         The beneficiary role is permissionless. Anyone can call tap() if
+     *         the user authorized their mandateId. The user IS the gate. If your
+     *         use case needs a beneficiary whitelist, override tap() in your
+     *         implementation.
+     *
+     *         On tap:
+     *         - One authorization is consumed (unless infinite).
+     *         - Immediate first-term payment: _rate is deducted from the user and
+     *           transferred to the beneficiary. User must have sufficient balance.
+     *         - User's outflow increases by _rate; balance starts decaying each term.
+     *         - Bucket entry is written at the next epoch for harvest accounting.
+     *         - Exit epoch is computed from current funded periods.
+     *
+     *         Self-tap is forbidden (beneficiary != user). Duplicate mandateId
+     *         on the same user reverts. Maximum MAX_TAPS concurrent mandates.
+     *
+     * @param _user  The user being tapped (payer).
+     * @param _rate  Tokens per term. Determines mandateId = keccak256(msg.sender, _rate).
+     */
     function tap(address _user, uint128 _rate) external virtual {
         bytes32 mid = _mandateId(msg.sender, _rate);
         uint256 auth = _authorizations[_user][mid];
@@ -328,12 +418,32 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Harvest (beneficiary collects income)
     // ──────────────────────────────────────────────
 
-    /// @notice Harvest income for a mandate. Caller passes beneficiary + rate;
-    ///         contract verifies the mandateId hash. Tokens go to beneficiary.
-    ///         Anyone can call; tokens always go to the beneficiary.
-    /// @dev total is accumulated as uint256 but principal is uint128. If total
-    ///      exceeds uint128.max (requires extreme rate * epochs * subscribers),
-    ///      the call reverts. Harvest more frequently to stay under the cap.
+    /**
+     * @notice Harvest income for a mandate. Permissionless; tokens always go to
+     *         the beneficiary regardless of caller.
+     *
+     *         Walks the bucket system epoch-by-epoch from the last checkpoint,
+     *         tallying entries (new subscribers) and exits (lapsed/revoked),
+     *         maintaining a running subscriber count. Each epoch's income =
+     *         count * rate. Accumulated total is credited to the beneficiary's
+     *         principal.
+     *
+     *         Cost scales linearly with neglect: monthly harvest = 1 epoch.
+     *         Skip 6 months = 6 iterations. It never bricks. Use _maxEpochs
+     *         to bound gas per call.
+     *
+     *         Multiple users sharing the same mandateId (same beneficiary + same
+     *         rate) are harvested together in one call. This is the core
+     *         scalability property: one harvest collects from all subscribers.
+     *
+     * @dev    Total is accumulated as uint256. Reverts if total exceeds uint128.max
+     *         (requires extreme rate * epochs * subscribers). Harvest more
+     *         frequently to stay under the cap.
+     *
+     * @param _beneficiary  The beneficiary address (combined with _rate to derive mandateId).
+     * @param _rate         The mandate rate (combined with _beneficiary to derive mandateId).
+     * @param _maxEpochs    Maximum epochs to process in this call (gas bound).
+     */
     function harvest(address _beneficiary, uint128 _rate, uint256 _maxEpochs) external {
         bytes32 mid = _mandateId(_beneficiary, _rate);
         Checkpoint storage cp = _checkpoints[mid];
@@ -370,10 +480,28 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Public: Comp (beneficiary pauses billing)
     // ──────────────────────────────────────────────
 
-    /// @notice Comp a user: pause billing for N terms. Caller must be the
-    ///         mandate's beneficiary. The user's balance freezes; billing
-    ///         resumes automatically when the comp period ends.
-    ///         NOTE: Anchor is shared. This pauses ALL of the user's mandates.
+    /**
+     * @notice Comp a user: pause billing for N terms. Caller must be the
+     *         mandate's beneficiary.
+     *
+     *         The user's balance freezes; no payments are deducted during the
+     *         comp period. When it ends, billing resumes automatically. No
+     *         re-authorization needed. This is how "3 months free" works.
+     *
+     *         Bucket entries/exits are updated: the user exits the bucket at
+     *         the current epoch and re-enters after the comp period, so the
+     *         beneficiary only earns for periods actually billed.
+     *
+     *         Cannot comp a user who is already comped (anchor in the future).
+     *
+     * @dev    IMPORTANT: Anchor is shared across all mandates. Comping via one
+     *         mandate pauses ALL of the user's mandates. This is a known
+     *         design tradeoff for O(1) balanceOf.
+     *
+     * @param _user    The user to comp.
+     * @param _rate    Rate of the caller's mandate (to derive mandateId and verify caller).
+     * @param _epochs  Number of terms to pause billing.
+     */
     function comp(address _user, uint128 _rate, uint16 _epochs) external virtual {
         bytes32 mid = _mandateId(msg.sender, _rate);
         _comp(_user, mid, _epochs);

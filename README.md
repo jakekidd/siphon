@@ -12,27 +12,20 @@ It works like a bank account. You hold tokens. A service provider sets up a **ma
 
 This isn't a protocol you deposit into. The token IS the protocol. Recurring payments are a native property of the token itself.
 
-## Siphonomics
+## Glossary
 
-**Mandate.** The recurring payment agreement; who gets paid, how much per term. Identified by `mandateId = keccak256(beneficiary, rate)`. The beneficiary creates mandates by **tapping** users who have pre-authorized them. Think of it as the bank's internal record of your autopay instruction.
+| Term | Definition |
+|---|---|
+| **Mandate** | Recurring payment agreement. `mandateId = keccak256(beneficiary, rate)`. |
+| **Tap** | Active mandate instance on a user. Beneficiary creates via `tap()`. |
+| **Outflow** | Sum of all active tap rates. Enables O(1) `balanceOf`. |
+| **Anchor** | Day index of last settlement. Periods elapsed = `(today - anchor) / TERM_DAYS`. |
+| **Entry/Exit** | Bucket system for harvest. Entry on tap, exit when funds will run out. |
+| **Comp** | Beneficiary pauses billing N terms. Balance freezes, resumes automatically. |
+| **Priority** | On lapse, first-tapped = first-paid. Lower-priority mandates lapse first. |
+| **Settlement** | Lazy: `balanceOf` is always current (O(1) math). Storage updates only on interaction. |
 
-**Tap.** The active instance of a mandate on a specific user. When a beneficiary taps a user, the user's balance starts draining at the mandate's rate. Multiple taps can be active simultaneously (up to `MAX_TAPS`), all drawing from one shared principal. The word works as both the noun (the user has 3 taps open) and the verb (the beneficiary taps the user).
-
-**Outflow.** The sum of all active tap rates for a user. This is what makes `balanceOf` O(1); instead of iterating each tap, the contract computes `principal - min(periodsElapsed, principal / outflow) * outflow` in one shot.
-
-**Lazy settlement.** `balanceOf` computes the above formula every time it's called; always current, always accurate, zero gas spent on scheduled payments. Storage only updates when someone interacts with the contract; that's when `_settle` materializes the lazy math into storage. No keeper, no cron job, no gas for recurring payments.
-
-**Authorization.** Users call `authorize(mandateId, count)` to pre-approve a mandate. Each `tap()` by the beneficiary consumes one authorization. Setting count to `type(uint256).max` means infinite; the beneficiary can re-tap freely after a revoke or lapse (useful for auto-renew flows where the user trusts the service). This mirrors ERC20's `approve` / `transferFrom` pattern but for recurring payments.
-
-The beneficiary role is permissionless; anyone can call `tap()` if the user authorized their mandateId. The user IS the gate. If your use case needs a beneficiary whitelist, override `tap()` in your implementation.
-
-**Entries and exits.** Beneficiaries need to collect income, but they don't know who their subscribers are on-chain. The contract solves this with shared count buckets per mandate: when a user is tapped, an **entry** is written at that epoch; when their funds will run out, an **exit** is written at that future epoch. The beneficiary calls `harvest()` which walks through epochs, tallies the running subscriber count, and multiplies by the rate. O(1) per user mutation; O(epochs) per harvest.
-
-Harvest cost scales linearly with neglect. Monthly harvest = 1 epoch, trivial. Skip 6 months = 6 iterations. It never bricks. Anyone can call `harvest()` on any mandate; tokens always go to the beneficiary.
-
-**Comp.** The beneficiary can comp a user: pause billing for N terms. The user's balance freezes; no payments are deducted. When the comp period ends, billing resumes automatically. No re-authorization needed. The beneficiary calls `comp(user, rate, epochs)` and the token moves the user's billing anchor forward. The service contract tracks "this user is comped" for its own access gating. This is how "3 months free" works.
-
-**Priority.** When a user's balance can't cover all active mandates, they're resolved in tap order (first-tapped = first-paid). Higher-priority mandates survive; lower-priority ones lapse. Principal is preserved during resolution — surviving taps consume from it via normal settlement in subsequent periods.
+See NatSpec on `tap()`, `harvest()`, `comp()`, `revoke()`, and `authorize()` for detailed mechanics.
 
 ## Configuration
 
@@ -42,7 +35,7 @@ Three immutables set at construction. Choose wisely; they're permanent.
 
 **`MAX_TAPS`** is the maximum simultaneous mandates per user. 32 is a generous default. If you need more, you might have a subscription problem. The real reason for the cap: operations that touch all of a user's mandates (deposit, spend, transfer) are O(n) in active taps. An unbounded array would mean unbounded gas.
 
-**`DEPLOY_DAY`** anchors epoch boundaries. Pass 0 to use the deployment day. Pass a specific day index to align epochs with an external system.
+**`GENESIS_DAY`** anchors epoch boundaries. Pass 0 to use the deployment day. Pass a specific day index to align epochs with an external system.
 
 ```solidity
 // monthly billing; up to 32 mandates per user; epoch anchor = deploy day
@@ -153,7 +146,7 @@ token.balanceOf(user)
 bytes32[] memory taps = token.getUserTaps(user)
 
 // details of a specific tap
-(uint128 rate, uint32 entryEpoch, uint32 revokedAt) = token.getTap(user, mid)
+(uint128 rate, uint32 entryEpoch, uint32 exitEpoch) = token.getTap(user, mid)
 
 // whether any mandate is active and funded
 token.isActive(user)
@@ -184,7 +177,7 @@ token.currentEpoch()
 
 **Subscriptions** (`src/example/StreamingSubscription.sol`). Plans with named tiers, subscribe, upgrade/downgrade (revoke + re-tap), comp (free months), access gating via `isTapActive`, revenue collection per plan. The flagship example; covers the full lifecycle.
 
-**Payroll** (`src/example/Payroll.sol`). Employer holds tokens; employees are beneficiaries at different salary rates. The employer's balance decays as salaries are paid. Employees call `token.tap()` and `token.harvest()` directly. The Payroll contract is bookkeeping — roster management, views, lapse detection via `IScheduleListener`. Shows the "one payer, many beneficiaries" pattern with priority (if the company runs low, hire order determines who gets paid first).
+**Payroll** (`src/example/Payroll.sol`). Employer holds tokens; employees are beneficiaries at different salary rates. The employer's balance decays as salaries are paid. Employees call `token.tap()` and `token.harvest()` directly. The Payroll contract is bookkeeping — roster management, views, lapse detection via `IMandateListener`. Shows the "one payer, many beneficiaries" pattern with priority (if the company runs low, hire order determines who gets paid first).
 
 **Rent** (`src/example/RentalAgreement.sol`). One landlord, many tenants, same rent rate. All tenants share the same mandateId (same beneficiary contract + same rate = same hash), so one `harvest()` call collects everyone's rent. Includes security deposit handling, lease terms, delinquency detection, and tenant self-move-out.
 
