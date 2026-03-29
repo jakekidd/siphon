@@ -8,14 +8,14 @@ import {RentalAgreement} from "../src/example/RentalAgreement.sol";
 import {Timeshare} from "../src/example/Timeshare.sol";
 import {TimeshareEscrow} from "../src/example/TimeshareEscrow.sol";
 import {SiphonToken} from "../src/SiphonToken.sol";
-import {IScheduleListener} from "../src/interfaces/IScheduleListener.sol";
+import {IMandateListener} from "../src/interfaces/IMandateListener.sol";
 import {Test} from "forge-std/Test.sol";
 
 // ──────────────────────────────────────────────
 // Mock listener
 // ──────────────────────────────────────────────
 
-contract MockListener is IScheduleListener {
+contract MockListener is IMandateListener {
     struct Call {
         address token;
         address user;
@@ -24,7 +24,7 @@ contract MockListener is IScheduleListener {
 
     Call[] public calls;
 
-    function onScheduleUpdate(address _token, address _user, bool _active) external {
+    function onMandateUpdate(address _token, address _user, bool _active) external {
         calls.push(Call(_token, _user, _active));
     }
 
@@ -838,7 +838,7 @@ contract SimpleSiphonTest is Test {
     // ================================================================
 
     function test_SiphonToken__immutables_setCorrectly() public view {
-        assertEq(token.DEPLOY_DAY(), 1000);
+        assertEq(token.GENESIS_DAY(), 1000);
         assertEq(token.TERM_DAYS(), 30);
         assertEq(token.MAX_TAPS(), 32);
     }
@@ -919,15 +919,15 @@ contract SimpleSiphonTest is Test {
         assertEq(anchor, 1000);
     }
 
-    function test_SiphonToken__getTap_returnsRateEntryEpochSponsor() public {
+    function test_SiphonToken__getTap_returnsFields() public {
         _mint(alice, RATE * 4);
         _tapViaSched(alice, treasury, RATE);
         bytes32 mid = _mid(treasury, RATE);
 
-        (uint128 rate, uint32 entryEpoch, uint32 revokedAt) = token.getTap(alice, mid);
+        (uint128 rate, uint32 entryEpoch, uint32 exitEpoch) = token.getTap(alice, mid);
         assertEq(rate, RATE);
         assertEq(entryEpoch, 1); // currentEpoch(0) + 1
-        assertEq(revokedAt, 0);
+        assertTrue(exitEpoch > 0); // exit computed by _recomputeAllExits
     }
 
     function test_SiphonToken__consumed_returnsCorrectAmount() public {

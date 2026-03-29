@@ -2,7 +2,7 @@
 pragma solidity ^0.8.23;
 
 import {SiphonToken} from "../SiphonToken.sol";
-import {IScheduleListener} from "../interfaces/IScheduleListener.sol";
+import {IMandateListener} from "../interfaces/IMandateListener.sol";
 
 /**
  * @title Payroll — Employer pays employees via SiphonToken mandates
@@ -20,9 +20,9 @@ import {IScheduleListener} from "../interfaces/IScheduleListener.sol";
  *         3. Employee: token.harvest(employee, salary, epochs) — collects pay
  *         4. Employer: token.revoke(employer, mandateId)  — terminates pay
  *
- *         Uses IScheduleListener to detect when payroll funds lapse.
+ *         Uses IMandateListener to detect when payroll funds lapse.
  */
-contract Payroll is IScheduleListener {
+contract Payroll is IMandateListener {
     SiphonToken public immutable token;
     address public employer;
 
@@ -96,7 +96,7 @@ contract Payroll is IScheduleListener {
 
     /// @notice Called by the token when the employer's schedule state changes.
     ///         Detects when payroll funds run out.
-    function onScheduleUpdate(address, address _user, bool _active) external {
+    function onMandateUpdate(address, address _user, bool _active) external {
         if (msg.sender != address(token)) return;
         if (_user == employer && !_active) {
             emit PayrollLapsed(employer);

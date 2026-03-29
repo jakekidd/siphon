@@ -3,7 +3,7 @@ pragma solidity ^0.8.23;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
+import {IMandateListener} from "./interfaces/IMandateListener.sol";
 
 /**
  * @title SiphonToken — ERC20 with scheduled payment deductions
@@ -19,7 +19,7 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  *     beneficiary. All mandates share one principal and use the same billing
  *     interval (TERM_DAYS). balanceOf is O(1) via outflow.
  *
- *   BENEFICIARY = SCHEDULER
+ *   BENEFICIARY MODEL
  *     The beneficiary IS the entity that taps users. msg.sender on tap() is
  *     the beneficiary. Users pre-authorize via authorize().
  *     mandateId = keccak256(beneficiary, rate).
@@ -30,7 +30,7 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  *
  *   COMP
  *     Beneficiary can pause billing for N terms via comp(). Moves the
- *     user's anchor forward; balance freezes, resumes automatically.
+ *     user's anchor forward; freezes payments, resumes automatically.
  *
  *   PRIORITY
  *     When funds run out, mandates are resolved in tap order (first-tapped
@@ -42,7 +42,7 @@ import {IScheduleListener} from "./interfaces/IScheduleListener.sol";
  *
  *   STRUCTS
  *     Account: { uint128 principal, uint128 outflow }  [1 slot shared per user]
- *     Tap: { uint128 rate, uint32 entryEpoch, uint32 revokedAt }  [1 slot per mandate]
+ *     Tap: { uint128 rate, uint32 entryEpoch, uint32 exitEpoch }  [1 slot per mandate]
  */
 abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
@@ -62,7 +62,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     error Unauthorized();
     error MaxTaps();
     error TapNotFound();
-    error NotActive();
     error AlreadyComped();
 
     // ──────────────────────────────────────────────
@@ -70,7 +69,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ──────────────────────────────────────────────
 
     event Tapped(address indexed user, bytes32 indexed mandateId, address beneficiary, uint128 rate);
-    event Revoked(address indexed user, bytes32 indexed mandateId, uint32 revokedAt);
+    event Revoked(address indexed user, bytes32 indexed mandateId, uint32 day);
     event Settled(address indexed user, uint256 amount);
     event Authorized(address indexed user, bytes32 indexed mandateId, uint256 count);
     event Spent(address indexed user, uint256 amount);
@@ -88,11 +87,11 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint128 outflow;
     }
 
-    /// @dev Per user per mandateId. 1 storage slot.
+    /// @dev Per user per mandateId. 1 storage slot (192 bits used, 64 free).
     struct Tap {
         uint128 rate;
         uint32 entryEpoch;
-        uint32 revokedAt;
+        uint32 exitEpoch;
     }
 
     /// @dev Collection checkpoint per mandateId. 1 storage slot.
@@ -111,7 +110,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Immutables
     // ──────────────────────────────────────────────
 
-    uint32 public immutable DEPLOY_DAY;
+    uint32 public immutable GENESIS_DAY;
     uint16 public immutable TERM_DAYS;
     uint8 public immutable MAX_TAPS;
 
@@ -134,19 +133,18 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
     mapping(address => bytes32[]) internal _userTaps;
     mapping(address => mapping(bytes32 => Tap)) internal _taps;
-    mapping(address => mapping(bytes32 => uint32)) internal _mandateExitEpoch;
 
     /// @dev Per-user burn outflow (subset of outflow that's burn mandates).
     mapping(address => uint128) internal _burnOutflow;
 
-    address public scheduleListener;
+    address public mandateListener;
 
     // ──────────────────────────────────────────────
     // Constructor
     // ──────────────────────────────────────────────
 
-    constructor(uint32 _deployDay, uint16 _termDays, uint8 _maxTaps) {
-        DEPLOY_DAY = _deployDay == 0 ? uint32(block.timestamp / _SECONDS_PER_DAY) : _deployDay;
+    constructor(uint32 _genesisDay, uint16 _termDays, uint8 _maxTaps) {
+        GENESIS_DAY = _genesisDay == 0 ? uint32(block.timestamp / _SECONDS_PER_DAY) : _genesisDay;
         require(_termDays > 0, "term must be > 0");
         require(_maxTaps > 0, "max taps must be > 0");
         TERM_DAYS = _termDays;
@@ -217,9 +215,9 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     }
 
     /// @notice Details of a specific tap on a user.
-    function getTap(address _user, bytes32 _mid) external view returns (uint128 rate, uint32 entryEpoch, uint32 revokedAt) {
+    function getTap(address _user, bytes32 _mid) external view returns (uint128 rate, uint32 entryEpoch, uint32 exitEpoch) {
         Tap storage t = _taps[_user][_mid];
-        return (t.rate, t.entryEpoch, t.revokedAt);
+        return (t.rate, t.entryEpoch, t.exitEpoch);
     }
 
     /// @notice All active mandate IDs for a user (ordered by priority).
@@ -243,7 +241,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function isTapActive(address _user, bytes32 _mid) external view returns (bool) {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) return false;
-        if (t.revokedAt > 0) return false;
         Account storage a = _accounts[_user];
         return _periodsElapsed(_user) <= _funded(a);
     }
@@ -253,7 +250,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return _today();
     }
 
-    /// @notice Current epoch index ((today - DEPLOY_DAY) / TERM_DAYS).
+    /// @notice Current epoch index ((today - GENESIS_DAY) / TERM_DAYS).
     function currentEpoch() external view returns (uint256) {
         return _epochOf();
     }
@@ -304,7 +301,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function revoke(address _user, bytes32 _mid) external virtual {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
-        // Verify caller is user or beneficiary (beneficiary recoverable from hash)
         if (msg.sender != _user) {
             if (_mandateId(msg.sender, t.rate) != _mid) revert Unauthorized();
         }
@@ -487,7 +483,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function _revoke(address _user, bytes32 _mid) internal {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
-        if (t.revokedAt > 0) revert NotActive();
 
         uint128 rate = t.rate;
         Account storage a = _accounts[_user];
@@ -498,13 +493,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         // Move exit to current epoch (preserves entry for historical harvest)
         if (!isBurn) {
-            uint32 oldExit = _mandateExitEpoch[_user][_mid];
+            uint32 oldExit = t.exitEpoch;
             if (oldExit > 0) _exits[_mid][uint256(oldExit)]--;
             _exits[_mid][_epochOf() + 1]++;
         }
 
         delete _taps[_user][_mid];
-        delete _mandateExitEpoch[_user][_mid];
         _removeFromUserTaps(_user, _mid);
         _recomputeAllExits(_user);
 
@@ -518,7 +512,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     function _comp(address _user, bytes32 _mid, uint16 _epochs) internal {
         Tap storage t = _taps[_user][_mid];
         if (t.rate == 0) revert TapNotFound();
-        if (t.revokedAt > 0) revert NotActive();
         if (_epochs == 0) revert InvalidMandate();
         if (_today() < uint256(_anchor[_user])) revert AlreadyComped();
 
@@ -527,7 +520,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint256 curEpoch = _epochOf();
         uint256 compDays = uint256(_epochs) * uint256(TERM_DAYS);
         uint256 newAnchorDay = _today() + compDays;
-        uint256 anchorEpoch = (newAnchorDay - uint256(DEPLOY_DAY)) / uint256(TERM_DAYS);
+        uint256 anchorEpoch = (newAnchorDay - uint256(GENESIS_DAY)) / uint256(TERM_DAYS);
 
         // Update bucket entries for all non-burn taps: exit now, re-enter after comp
         bytes32[] storage uTaps = _userTaps[_user];
@@ -604,19 +597,19 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return keccak256(abi.encode(_beneficiary, _rate));
     }
 
-    /// @dev Current epoch index. Epochs are TERM_DAYS-wide windows anchored at DEPLOY_DAY.
+    /// @dev Current epoch index. Epochs are TERM_DAYS-wide windows anchored at GENESIS_DAY.
     function _epochOf() internal view returns (uint256) {
         uint256 today = _today();
-        if (today <= uint256(DEPLOY_DAY)) return 0;
-        return (today - uint256(DEPLOY_DAY)) / uint256(TERM_DAYS);
+        if (today <= uint256(GENESIS_DAY)) return 0;
+        return (today - uint256(GENESIS_DAY)) / uint256(TERM_DAYS);
     }
 
     /// @dev Convert a user's anchor to an epoch index. Used for exit
     ///      computation so exits are relative to billing start, not wall clock.
     function _anchorEpoch(address _user) internal view returns (uint256) {
         uint32 anch = _anchor[_user];
-        if (uint256(anch) <= uint256(DEPLOY_DAY)) return 0;
-        return (uint256(anch) - uint256(DEPLOY_DAY)) / uint256(TERM_DAYS);
+        if (uint256(anch) <= uint256(GENESIS_DAY)) return 0;
+        return (uint256(anch) - uint256(GENESIS_DAY)) / uint256(TERM_DAYS);
     }
 
     // ──────────────────────────────────────────────
@@ -631,13 +624,12 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint256 elapsed = _periodsElapsed(_user);
         if (elapsed == 0) return;
 
-        uint256 funded = _funded(a);
-        uint256 periods = elapsed < funded ? elapsed : funded;
+        uint256 f = _funded(a);
+        uint256 periods = elapsed < f ? elapsed : f;
         uint256 con = periods * uint256(a.outflow);
 
         if (con > 0) {
             a.principal -= uint128(con);
-            // Attribute burn portion to totalBurned
             uint128 burnRate = _burnOutflow[_user];
             if (burnRate > 0) {
                 totalBurned += periods * uint256(burnRate);
@@ -647,7 +639,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         _anchor[_user] = uint32(_today());
 
-        if (elapsed > funded) {
+        if (elapsed > f) {
             _resolvePriority(_user);
         }
     }
@@ -676,12 +668,10 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
                 committed += uint256(t.rate);
                 i++;
             } else {
-                // Lapse — clean up tap but preserve bucket entries/exits
                 bool isBurn = _mandateId(address(0), t.rate) == mid;
                 a.outflow -= t.rate;
                 if (isBurn) _burnOutflow[_user] -= t.rate;
                 delete _taps[_user][mid];
-                delete _mandateExitEpoch[_user][mid];
 
                 for (uint256 j = i; j < taps.length - 1; j++) {
                     taps[j] = taps[j + 1];
@@ -692,7 +682,6 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
             }
         }
 
-        // Recompute exits for surviving taps (outflow changed → funded changed)
         _recomputeAllExits(_user);
 
         if (taps.length == 0) {
@@ -716,15 +705,16 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
         for (uint256 i; i < taps.length; i++) {
             bytes32 mid = taps[i];
-            bool isBurn = _mandateId(address(0), _taps[_user][mid].rate) == mid;
+            Tap storage t = _taps[_user][mid];
+            bool isBurn = _mandateId(address(0), t.rate) == mid;
             if (isBurn) continue;
 
-            uint32 oldExit = _mandateExitEpoch[_user][mid];
+            uint32 oldExit = t.exitEpoch;
 
             if (uint256(oldExit) != newExit) {
                 if (oldExit > 0) _exits[mid][uint256(oldExit)]--;
                 _exits[mid][newExit]++;
-                _mandateExitEpoch[_user][mid] = uint32(newExit);
+                t.exitEpoch = uint32(newExit);
             }
         }
     }
@@ -748,17 +738,17 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Listener
     // ──────────────────────────────────────────────
 
-    /// @dev Set the schedule listener (receives callbacks on tap/revoke/lapse).
+    /// @dev Set the mandate listener (receives callbacks on tap/revoke/lapse).
     function _setListener(address _listener) internal {
-        scheduleListener = _listener;
+        mandateListener = _listener;
         emit ListenerSet(_listener);
     }
 
     /// @dev Best-effort callback to the listener. Silently swallows reverts so
     ///      a broken listener can't block core operations.
     function _notifyListener(address _user, bool _active) internal {
-        address listener = scheduleListener;
+        address listener = mandateListener;
         if (listener == address(0)) return;
-        try IScheduleListener(listener).onScheduleUpdate(address(this), _user, _active) {} catch {}
+        try IMandateListener(listener).onMandateUpdate(address(this), _user, _active) {} catch {}
     }
 }
