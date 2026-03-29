@@ -6,14 +6,16 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 import {IMandateListener} from "./interfaces/IMandateListener.sol";
 
 /**
- * @title SiphonToken — ERC20 with scheduled payment deductions
+ * @title SiphonToken — ERC20 with mandate-based autopay
  * @author Ubitel
  *
  * @notice Abstract ERC20 where balanceOf decays over time via concurrent
  *         payment mandates. Implementations provide name/symbol/decimals,
  *         access control, and mint/spend entry points.
  *
- * @dev Storage layout (14 base slots, 0-13). Inheritors start at slot 14+.
+ * @dev Storage layout (14 declared state variables, base slots 0-13).
+ *      Inheritors should start their own state at slot 14+.
+ *      Mappings reserve a base slot for the hash seed; actual data lives at keccak256(key, slot).
  *
  *       Slot | Variable              | Type
  *       -----+-----------------------+--------------------------------------
@@ -85,16 +87,16 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Structs
     // ──────────────────────────────────────────────
 
-    /// @notice Per-user account. Packed into 1 storage slot (256 bits).
-    /// @dev principal: stored token balance (before lazy deductions).
+    /// @dev Per-user account. Packed into 1 storage slot (256 bits).
+    ///      principal: stored token balance (before lazy deductions).
     ///      outflow: sum of all active tap rates. balanceOf = principal - consumed(outflow).
     struct Account {
         uint128 principal;
         uint128 outflow;
     }
 
-    /// @notice Per-user per-mandate tap record. Packed into 1 storage slot (192/256 bits).
-    /// @dev rate: tokens per term paid to the beneficiary.
+    /// @dev Per-user per-mandate tap record. Packed into 1 storage slot (192/256 bits).
+    ///      rate: tokens per term paid to the beneficiary.
     ///      entryEpoch: epoch when this tap entered the bucket system.
     ///      exitEpoch: projected epoch when funds run out (updated on principal/outflow changes).
     struct Tap {
@@ -103,8 +105,8 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         uint32 exitEpoch;
     }
 
-    /// @notice Harvest checkpoint per mandateId. Packed into 1 storage slot (256 bits).
-    /// @dev lastEpoch: last epoch processed by harvest().
+    /// @dev Harvest checkpoint per mandateId. Packed into 1 storage slot (256 bits).
+    ///      lastEpoch: last epoch processed by harvest().
     ///      count: running number of active subscribers at lastEpoch.
     struct Checkpoint {
         uint32 lastEpoch;
@@ -201,19 +203,25 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // ERC20
     // ──────────────────────────────────────────────
 
+    /// @notice Spendable balance after all active mandates. Computed lazily, always current.
+    /// @dev O(1): principal - min(periodsElapsed, funded) * outflow. No iteration.
     function balanceOf(address _user) external view returns (uint256) {
         return _balance(_user);
     }
 
+    /// @notice Total tokens in circulation. Stale between settlements — see Tradeoffs in README.
+    /// @dev Does not reflect unsettled consumption or unharvested beneficiary income.
     function totalSupply() external view returns (uint256) {
         return totalMinted - totalBurned - totalSpent;
     }
 
+    /// @notice ERC20 transfer. Settles both sides. Subject to _beforeTransfer hook.
     function transfer(address _to, uint256 _amount) external virtual returns (bool) {
         _transfer(msg.sender, _to, _amount);
         return true;
     }
 
+    /// @notice ERC20 transferFrom. Settles both sides. Subject to _beforeTransfer hook.
     function transferFrom(address _from, address _to, uint256 _amount) external virtual returns (bool) {
         uint256 allowed = _allowances[_from][msg.sender];
         if (allowed != type(uint256).max) {
@@ -224,12 +232,14 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         return true;
     }
 
+    /// @notice ERC20 approve. Separate from mandate authorization (authorize()).
     function approve(address _spender, uint256 _amount) external virtual returns (bool) {
         _allowances[msg.sender][_spender] = _amount;
         emit Approval(msg.sender, _spender, _amount);
         return true;
     }
 
+    /// @notice ERC20 allowance.
     function allowance(address _owner, address _spender) external view returns (uint256) {
         return _allowances[_owner][_spender];
     }
@@ -552,9 +562,13 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
         emit Transfer(_from, _to, _amount);
     }
 
-    /// @dev Hook called before every transfer. Override to add restrictions
+    /// @dev Hook called before every ERC20 transfer. Override to add restrictions
     ///      (e.g. whitelist, pause, exchange regulation). Reverts block the transfer.
-    ///      Default: no-op (open transfers).
+    ///      Default: no-op (open transfers). Not called by _mint, _spend, or _tap
+    ///      (those manipulate principal directly).
+    /// @param _from   Sender address.
+    /// @param _to     Receiver address.
+    /// @param _amount Transfer amount.
     function _beforeTransfer(address _from, address _to, uint256 _amount) internal virtual {}
 
     /// @dev Tap a user into a mandate. Immediate first-term payment to beneficiary.
@@ -744,7 +758,23 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     // Internal: Settlement
     // ──────────────────────────────────────────────
 
-    /// @dev Settle: deduct consumed, reset anchor. On lapse, resolve priority.
+    /**
+     * @dev Settle: materialize lazy consumption into storage.
+     *
+     *      1. Compute periods elapsed since anchor and tokens consumed.
+     *      2. Deduct consumed from principal. Attribute burn portion to totalBurned.
+     *      3. Reset anchor to today (next settlement starts from here).
+     *      4. If elapsed > funded (user ran out of money): resolve priority
+     *         to determine which mandates survive and which lapse.
+     *
+     *      Idempotent within a term: if no full periods have elapsed since the
+     *      last anchor, the function is a no-op. During comp (anchor in the future),
+     *      periodsElapsed returns 0 so settle is also a no-op — the comp anchor
+     *      is preserved until it naturally expires.
+     *
+     *      Called at the start of every mutation (_mint, _spend, _transfer, _tap,
+     *      _revoke, _comp) to ensure principal is current before modification.
+     */
     function _settle(address _user) internal {
         Account storage a = _accounts[_user];
         if (a.outflow == 0) return;
