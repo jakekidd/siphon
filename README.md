@@ -99,6 +99,7 @@ contract StreamingSubscription {
     // Upgrade or downgrade: revoke old mandate, tap new one
     function changePlan(uint256 _newPlanId) external {
         Plan storage oldPlan = plans[userPlan[msg.sender]];
+        Plan storage newPlan = plans[_newPlanId];
         bytes32 oldMid = token.mandateId(address(this), oldPlan.rate);
         token.revoke(msg.sender, oldMid);     // revoke old
         token.tap(msg.sender, newPlan.rate);   // tap new
@@ -175,6 +176,8 @@ token.currentEpoch()
 
 ## Use cases and examples
 
+See `src/example/README.md` for a detailed walkthrough organized by pattern (payments vs burns, one-to-many vs many-to-one, admin vs user-authorized, etc.).
+
 **Subscriptions** (`src/example/StreamingSubscription.sol`). Plans with named tiers, subscribe, upgrade/downgrade (revoke + re-tap), comp (free months), access gating via `isTapActive`, revenue collection per plan. The flagship example; covers the full lifecycle.
 
 **Payroll** (`src/example/Payroll.sol`). Employer holds tokens; employees are beneficiaries at different salary rates. The employer's balance decays as salaries are paid. Employees call `token.tap()` and `token.harvest()` directly. The Payroll contract is bookkeeping: roster management, views, lapse detection via `IMandateListener`. Shows the "one payer, many beneficiaries" pattern with priority (if the company runs low, hire order determines who gets paid first).
@@ -183,7 +186,7 @@ token.currentEpoch()
 
 **Timeshare** (`src/example/Timeshare.sol` + `TimeshareEscrow.sol`). Rotating payment responsibility among multiple users. Two-contract architecture: Timeshare (manager/beneficiary) deploys a TimeshareEscrow per agreement. Members deposit their share into the escrow each season; the escrow gets tapped and its balance drains at rate-per-term. Round-robin access rotation, seasonal renewal with automatic leftover refunds, comp (property maintenance), and funding reclaim with deadlines. Shows the "many payers, one pool, one beneficiary" pattern.
 
-**Protocol burns.** A token where holding costs something. Burn mandates (`beneficiary = address(0)`) drain the balance into the void, reducing total supply. No beneficiary to harvest; the tokens just disappear. Use `_tap(user, address(0), rate)` internally.
+**Decay / burns** (`src/example/DecayToken.sol`). Deflationary token where holding costs something. Every holder gets a burn mandate (`beneficiary = address(0)`) on mint. Balance decays each term, reducing total supply. No beneficiary to harvest; the tokens just disappear. Shows `_tap` with burn mechanics, runway calculation, and admin exemption.
 
 ## Tradeoffs
 

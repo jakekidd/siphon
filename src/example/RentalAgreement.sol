@@ -81,13 +81,17 @@ contract RentalAgreement {
         emit LeaseStarted(_tenant, leases[_tenant].startDay, _endDay, _deposit);
     }
 
-    /// @notice End a lease. Revokes the mandate and returns the deposit.
+    /// @notice End a lease. Revokes the mandate (if still active) and returns
+    ///         the deposit. Works whether the tenant is current or already moved out.
     function endLease(address _tenant) external onlyLandlord {
         Lease storage lease = leases[_tenant];
         if (!lease.active) revert NotTenant();
 
+        // Revoke mandate if tenant hasn't already moved out
         bytes32 mid = mandateId();
-        token.revoke(_tenant, mid);
+        if (token.isTapActive(_tenant, mid)) {
+            token.revoke(_tenant, mid);
+        }
 
         // Return deposit
         if (lease.deposit > 0) {
@@ -120,6 +124,7 @@ contract RentalAgreement {
 
         bytes32 mid = mandateId();
         token.revoke(msg.sender, mid);
+        lease.active = false;
         // Note: deposit held until landlord calls endLease
     }
 

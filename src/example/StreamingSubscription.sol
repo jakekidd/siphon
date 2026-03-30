@@ -25,6 +25,10 @@ contract StreamingSubscription {
     // user => current planId (0 = not subscribed)
     mapping(address => uint256) public userPlan;
 
+    event Subscribed(address indexed user, uint256 indexed planId);
+    event Canceled(address indexed user, uint256 indexed planId);
+    event PlanChanged(address indexed user, uint256 indexed oldPlanId, uint256 indexed newPlanId);
+
     error Unauthorized();
     error InvalidPlan();
     error NotSubscribed();
@@ -59,6 +63,8 @@ contract StreamingSubscription {
 
         userPlan[msg.sender] = _planId;
         token.tap(msg.sender, plan.rate);
+
+        emit Subscribed(msg.sender, _planId);
     }
 
     /// @notice Upgrade or downgrade to a different plan. Revokes old mandate,
@@ -78,6 +84,8 @@ contract StreamingSubscription {
         // Tap new mandate
         userPlan[msg.sender] = _newPlanId;
         token.tap(msg.sender, newPlan.rate);
+
+        emit PlanChanged(msg.sender, oldPlanId, _newPlanId);
     }
 
     /// @notice Cancel subscription. User or this contract can revoke.
@@ -89,6 +97,8 @@ contract StreamingSubscription {
         bytes32 mid = token.mandateId(address(this), plan.rate);
         token.revoke(msg.sender, mid);
         userPlan[msg.sender] = 0;
+
+        emit Canceled(msg.sender, planId);
     }
 
     // ── Comp (free months) ──
