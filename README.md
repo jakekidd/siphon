@@ -10,6 +10,8 @@ SiphonToken is an ERC20 where `balanceOf` is a mathematical function of time, no
 
 It works like a bank account. You hold tokens. A service provider sets up a **mandate** to draw from your balance on a schedule. You authorized it. The payments happen. If you run out of funds, the mandate lapses. If you want to stop, you revoke it. Multiple mandates can run simultaneously from one balance; first-authorized gets priority when funds are low.
 
+The same balance also supports one-time deductions via **spend**: marketplace purchases, usage charges, fees. Mandates and spend draw from the same principal and compose naturally. A recurring base subscription and on-demand usage charges can run simultaneously on one balance (see `ServiceCredit` example).
+
 This isn't a protocol you deposit into. The token IS the protocol. Recurring payments are a native property of the token itself.
 
 ## Glossary
@@ -22,6 +24,7 @@ This isn't a protocol you deposit into. The token IS the protocol. Recurring pay
 | **Anchor** | Day index of last settlement. Periods elapsed = `(today - anchor) / TERM_DAYS`. |
 | **Entry/Exit** | Bucket system for harvest. Entry on tap, exit when funds will run out. |
 | **Comp** | Beneficiary pauses billing N terms. Balance freezes, resumes automatically. |
+| **Spend** | One-time deduction from a user's balance. Marketplace purchases, usage charges, fees. |
 | **Priority** | On lapse, first-tapped = first-paid. Lower-priority mandates lapse first. |
 | **Settlement** | Lazy: `balanceOf` is always current (O(1) math). Storage updates only on interaction. |
 
@@ -172,6 +175,12 @@ token.mandateId(beneficiary, rate)
 
 // current epoch number
 token.currentEpoch()
+
+// supply accounting
+token.totalSupply()    // totalMinted - totalBurned - totalSpent
+token.totalMinted      // cumulative tokens ever minted
+token.totalBurned      // cumulative tokens destroyed by burn mandates
+token.totalSpent       // cumulative tokens removed via _spend
 ```
 
 ## Use cases and examples
