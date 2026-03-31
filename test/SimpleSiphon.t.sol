@@ -7,6 +7,9 @@ import {Payroll} from "../src/example/Payroll.sol";
 import {RentalAgreement} from "../src/example/RentalAgreement.sol";
 import {Timeshare} from "../src/example/Timeshare.sol";
 import {TimeshareEscrow} from "../src/example/TimeshareEscrow.sol";
+import {DecayToken} from "../src/example/DecayToken.sol";
+import {Vesting} from "../src/example/Vesting.sol";
+import {ServiceCredit} from "../src/example/ServiceCredit.sol";
 import {SiphonToken} from "../src/SiphonToken.sol";
 import {IMandateListener} from "../src/interfaces/IMandateListener.sol";
 import {Test} from "forge-std/Test.sol";
@@ -2443,6 +2446,1019 @@ contract TimeshareTest is Test {
         _advanceDays(30 * TERMS_PER_SEASON);
 
         (bool active,) = ts.hasAccess(id);
+        assertFalse(active);
+    }
+}
+
+// ================================================================
+//  DecayToken tests
+// ================================================================
+
+contract DecayTokenTest is Test {
+    DecayToken public token;
+
+    address public owner = makeAddr("owner");
+    address public alice = makeAddr("alice");
+    address public bob   = makeAddr("bob");
+
+    uint128 constant DECAY_RATE = 100 ether;
+    uint256 constant DAY        = 86_400;
+
+    function setUp() public {
+        _warpToDay(1000);
+        // Deploy as owner so msg.sender == owner and token.owner() == owner
+        vm.prank(owner);
+        token = new DecayToken(30, DECAY_RATE);
+    }
+
+    function _warpToDay(uint256 d) internal { vm.warp(d * DAY); }
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
+
+    function _mint(address user, uint128 amt) internal {
+        vm.prank(owner);
+        token.mint(user, amt);
+    }
+
+    // ── mint applies burn tap and starts decay ──
+
+    function test_DecayToken__mint_appliesBurnTapOnFirstMint() public {
+        _mint(alice, DECAY_RATE * 5);
+
+        // Burn mandate exists: mandateId(address(0), DECAY_RATE)
+        bytes32 mid = keccak256(abi.encode(address(0), DECAY_RATE));
+        assertTrue(token.isTapActive(alice, mid));
+    }
+
+    function test_DecayToken__mint_deductsFirstTermImmediately() public {
+        _mint(alice, DECAY_RATE * 5);
+        // First-term burn deducted on tap
+        assertEq(token.balanceOf(alice), DECAY_RATE * 4);
+    }
+
+    // ── mint tops up existing holder (no new tap) ──
+
+    function test_DecayToken__mint_topsUpExistingHolderWithoutNewTap() public {
+        _mint(alice, DECAY_RATE * 3);
+        uint256 balAfterFirst = token.balanceOf(alice);
+
+        // Top up: should not revert (no duplicate tap), balance increases
+        _mint(alice, DECAY_RATE * 2);
+        assertEq(token.balanceOf(alice), balAfterFirst + DECAY_RATE * 2);
+    }
+
+    function test_DecayToken__mint_topUpExtendsRunway() public {
+        _mint(alice, DECAY_RATE * 2);
+        uint256 runwayBefore = token.runway(alice);
+
+        _mint(alice, DECAY_RATE * 3);
+        uint256 runwayAfter = token.runway(alice);
+
+        assertTrue(runwayAfter > runwayBefore);
+    }
+
+    // ── runway returns correct terms ──
+
+    function test_DecayToken__runway_returnsCorrectTerms() public {
+        // Mint 5 terms worth; first term deducted immediately, so 4 remain
+        _mint(alice, DECAY_RATE * 5);
+        assertEq(token.runway(alice), 4);
+    }
+
+    function test_DecayToken__runway_returnsZeroWhenNoTap() public {
+        assertEq(token.runway(alice), 0);
+    }
+
+    // ── balance decays over time ──
+
+    function test_DecayToken__balanceOf_decaysOverTime() public {
+        _mint(alice, DECAY_RATE * 5);
+        uint256 balAfterMint = token.balanceOf(alice); // 4 terms remaining
+
+        _advanceDays(30); // 1 term passes
+        assertEq(token.balanceOf(alice), balAfterMint - DECAY_RATE);
+
+        _advanceDays(30); // 2nd term
+        assertEq(token.balanceOf(alice), balAfterMint - DECAY_RATE * 2);
+    }
+
+    function test_DecayToken__balanceOf_zeroWhenFullyDecayed() public {
+        _mint(alice, DECAY_RATE * 2); // 1 term remaining after first deduction
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), 0);
+    }
+
+    // ── exempt removes burn mandate ──
+
+    function test_DecayToken__exempt_removesBurnMandate() public {
+        _mint(alice, DECAY_RATE * 5);
+
+        vm.prank(owner);
+        token.exempt(alice);
+
+        bytes32 mid = keccak256(abi.encode(address(0), DECAY_RATE));
+        assertFalse(token.isTapActive(alice, mid));
+    }
+
+    function test_DecayToken__exempt_freezesBalanceAfterRemoval() public {
+        _mint(alice, DECAY_RATE * 5);
+        uint256 balBeforeExempt = token.balanceOf(alice);
+
+        vm.prank(owner);
+        token.exempt(alice);
+
+        _advanceDays(60); // 2 terms pass
+        assertEq(token.balanceOf(alice), balBeforeExempt);
+    }
+
+    function test_DecayToken__exempt_revertsWhenNotOwner() public {
+        _mint(alice, DECAY_RATE * 5);
+        vm.prank(alice);
+        vm.expectRevert(SiphonToken.Unauthorized.selector);
+        token.exempt(alice);
+    }
+
+    // ── full lifecycle: mint, decay, top up, exempt ──
+
+    function test_DecayToken__lifecycle_mintDecayTopUpExempt() public {
+        // Mint 4 terms worth; 3 remain after immediate deduction
+        _mint(alice, DECAY_RATE * 4);
+        assertEq(token.balanceOf(alice), DECAY_RATE * 3);
+
+        // 1 term passes
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), DECAY_RATE * 2);
+        // runway() reads stored principal (not yet settled) / outflow = 3 terms
+        assertEq(token.runway(alice), 3);
+
+        // Top up 2 more terms; runway extends
+        _mint(alice, DECAY_RATE * 2);
+        assertEq(token.runway(alice), 4);
+
+        // 1 more term passes
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), DECAY_RATE * 3);
+
+        // Owner exempts alice: balance freezes
+        vm.prank(owner);
+        token.exempt(alice);
+        uint256 frozenBal = token.balanceOf(alice);
+
+        _advanceDays(90);
+        assertEq(token.balanceOf(alice), frozenBal);
+        assertEq(token.runway(alice), 0);
+    }
+}
+
+// ================================================================
+//  Vesting tests
+// ================================================================
+
+// Note on Vesting contract design: activate() calls token.tap(grantor, rate)
+// from inside the Vesting contract, making address(vesting) the beneficiary.
+// The grantor must therefore authorize mandateId(address(vesting), rate).
+// isVesting and collect use mandateId(recipient, rate), so they check a
+// separate bucket. The full lifecycle test covers the correct integration path.
+
+contract VestingTest is Test {
+    SimpleSiphon public token;
+    Vesting public vesting;
+
+    address public owner    = makeAddr("owner");
+    address public admin    = makeAddr("admin");
+    address public grantor  = makeAddr("grantor");
+    address public alice    = makeAddr("alice");
+    address public bob      = makeAddr("bob");
+
+    uint128 constant RATE  = 500 ether;
+    uint32  constant TERMS = 6;
+    uint256 constant DAY   = 86_400;
+
+    function setUp() public {
+        _warpToDay(1000);
+        token   = new SimpleSiphon(owner);
+        vesting = new Vesting(address(token), admin, grantor);
+
+        vm.startPrank(owner);
+        token.setScheduler(owner);
+        token.setSpender(owner);
+        vm.stopPrank();
+    }
+
+    function _warpToDay(uint256 d) internal { vm.warp(d * DAY); }
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
+
+    function _mintGrantor(uint128 amt) internal {
+        vm.prank(owner);
+        token.mint(grantor, amt);
+    }
+
+    function _mid(address beneficiary, uint128 rate) internal pure returns (bytes32) {
+        return keccak256(abi.encode(beneficiary, rate));
+    }
+
+    /// @dev Authorization the grantor needs to give before alice calls activate().
+    ///      token.tap() inside activate() uses msg.sender (= vesting contract) as beneficiary.
+    function _authVestingMid(uint256 count) internal {
+        bytes32 mid = _mid(address(vesting), RATE);
+        vm.prank(grantor);
+        token.authorize(mid, count);
+    }
+
+    // ── createGrant stores grant ──
+
+    function test_Vesting__createGrant_storesGrant() public {
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        (address recipient, uint128 rate, uint32 terms, bool created) = vesting.grants(id);
+        assertEq(recipient, alice);
+        assertEq(rate, RATE);
+        assertEq(terms, TERMS);
+        assertTrue(created);
+        assertEq(vesting.grantCount(), 1);
+    }
+
+    function test_Vesting__createGrant_revertsWhenNotAdmin() public {
+        vm.prank(alice);
+        vm.expectRevert(Vesting.Unauthorized.selector);
+        vesting.createGrant(alice, RATE, TERMS);
+    }
+
+    function test_Vesting__createGrant_revertsOnZeroRate() public {
+        vm.prank(admin);
+        vm.expectRevert(Vesting.InvalidGrant.selector);
+        vesting.createGrant(alice, 0, TERMS);
+    }
+
+    function test_Vesting__createGrant_revertsOnZeroTerms() public {
+        vm.prank(admin);
+        vm.expectRevert(Vesting.InvalidGrant.selector);
+        vesting.createGrant(alice, RATE, 0);
+    }
+
+    function test_Vesting__createGrant_revertsOnZeroRecipient() public {
+        vm.prank(admin);
+        vm.expectRevert(Vesting.InvalidGrant.selector);
+        vesting.createGrant(address(0), RATE, TERMS);
+    }
+
+    // ── activate taps grantor and starts vesting ──
+
+    function test_Vesting__activate_tapsGrantorAndMarksActivated() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        // Grantor must authorize mandateId(vesting, rate) since vesting is the tap caller
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        assertTrue(vesting.activated(id));
+        // Tap active for vesting-beneficiary mandate
+        assertTrue(token.isTapActive(grantor, _mid(address(vesting), RATE)));
+        // First term went to vesting contract immediately
+        assertEq(token.balanceOf(address(vesting)), RATE);
+    }
+
+    function test_Vesting__activate_revertsWhenNotRecipient() public {
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        vm.prank(bob);
+        vm.expectRevert(Vesting.NotRecipient.selector);
+        vesting.activate(id);
+    }
+
+    function test_Vesting__activate_revertsWhenAlreadyActivated() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        vm.prank(alice);
+        vm.expectRevert(Vesting.AlreadyActivated.selector);
+        vesting.activate(id);
+    }
+
+    function test_Vesting__activate_revertsWhenGrantorNotAuthorized() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        // No authorization given: should revert NotApproved
+        vm.prank(alice);
+        vm.expectRevert(SiphonToken.NotApproved.selector);
+        vesting.activate(id);
+    }
+
+    // ── collect harvests and forwards to recipient ──
+
+    function test_Vesting__collect_harvestsAndForwardsToRecipient() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        _advanceDays(30); // 1 epoch
+
+        uint256 aliceBalBefore = token.balanceOf(alice);
+        vesting.collect(id, 5);
+        // Harvested 1 epoch of RATE, forwarded to alice
+        assertEq(token.balanceOf(alice) - aliceBalBefore, RATE);
+        // Vesting contract should have 0 (immediate payment from tap was already there,
+        // but collect forwards everything harvested to recipient)
+    }
+
+    function test_Vesting__collect_noopWhenNothingToHarvest() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        // No time passed since activation, nothing to harvest
+        uint256 aliceBalBefore = token.balanceOf(alice);
+        vesting.collect(id, 5);
+        assertEq(token.balanceOf(alice), aliceBalBefore);
+    }
+
+    // ── revokeGrant stops future vesting ──
+
+    function test_Vesting__revokeGrant_stopsFutureVesting() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        bytes32 activeMid = _mid(address(vesting), RATE);
+        assertTrue(token.isTapActive(grantor, activeMid));
+
+        vm.prank(admin);
+        vesting.revokeGrant(id);
+
+        // Tap is now revoked
+        assertFalse(token.isTapActive(grantor, activeMid));
+
+        // Grantor balance frozen after revoke
+        uint256 grantorBal = token.balanceOf(grantor);
+        _advanceDays(30);
+        assertEq(token.balanceOf(grantor), grantorBal);
+    }
+
+    function test_Vesting__revokeGrant_revertsWhenNotAdmin() public {
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        vm.prank(alice);
+        vm.expectRevert(Vesting.Unauthorized.selector);
+        vesting.revokeGrant(id);
+    }
+
+    function test_Vesting__revokeGrant_revertsWhenNotActivated() public {
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        vm.prank(admin);
+        vm.expectRevert(Vesting.NotActivated.selector);
+        vesting.revokeGrant(id);
+    }
+
+    // ── isVesting returns correct state ──
+
+    function test_Vesting__isVesting_falseBeforeActivation() public {
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+        assertFalse(vesting.isVesting(id));
+    }
+
+    function test_Vesting__isVesting_trueAfterActivate() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        assertTrue(vesting.isVesting(id));
+    }
+
+    function test_Vesting__isVesting_falseAfterRevoke() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+
+        vm.prank(admin);
+        vesting.revokeGrant(id);
+
+        assertFalse(vesting.isVesting(id));
+    }
+
+    // ── multiple grants with priority ──
+
+    function test_Vesting__multipleGrants_bothActivateSuccessfully() public {
+        uint128 rateA = 300 ether;
+        uint128 rateB = 200 ether;
+
+        // Mint enough for both first-term payments plus several future terms
+        _mintGrantor(rateA + rateB + (rateA + rateB) * 3);
+
+        vm.startPrank(admin);
+        uint256 idA = vesting.createGrant(alice, rateA, 3);
+        uint256 idB = vesting.createGrant(bob, rateB, 3);
+        vm.stopPrank();
+
+        // Both streams use the vesting contract as beneficiary, so they need
+        // separate authorizations using mandateId(vesting, rateA) and (vesting, rateB)
+        bytes32 midA = _mid(address(vesting), rateA);
+        bytes32 midB = _mid(address(vesting), rateB);
+
+        vm.startPrank(grantor);
+        token.authorize(midA, 1);
+        token.authorize(midB, 1);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        vesting.activate(idA);
+
+        vm.prank(bob);
+        vesting.activate(idB);
+
+        assertTrue(vesting.activated(idA));
+        assertTrue(vesting.activated(idB));
+
+        // Both taps active on grantor; balance drains from both
+        assertTrue(token.isTapActive(grantor, midA));
+        assertTrue(token.isTapActive(grantor, midB));
+        assertTrue(vesting.fundedTerms() > 0);
+    }
+
+    // ── full lifecycle: create, activate, collect, revoke ──
+
+    function test_Vesting__lifecycle_createActivateCollectRevoke() public {
+        _mintGrantor(RATE * (TERMS + 1));
+
+        // Create grant
+        vm.prank(admin);
+        uint256 id = vesting.createGrant(alice, RATE, TERMS);
+        assertFalse(vesting.activated(id));
+        assertFalse(vesting.isVesting(id));
+
+        // Activate: grantor authorizes mandateId(vesting, RATE)
+        _authVestingMid(1);
+
+        vm.prank(alice);
+        vesting.activate(id);
+        assertTrue(vesting.activated(id));
+        assertTrue(vesting.isVesting(id));
+
+        // Immediate first payment goes to vesting contract
+        assertEq(token.balanceOf(address(vesting)), RATE);
+
+        // Collect 2 terms of vested tokens (harvest + forward to alice)
+        _advanceDays(60);
+        uint256 aliceBefore = token.balanceOf(alice);
+        vesting.collect(id, 10);
+        assertEq(token.balanceOf(alice) - aliceBefore, RATE * 2);
+
+        // Revoke via admin
+        vm.prank(admin);
+        vesting.revokeGrant(id);
+        assertFalse(vesting.isVesting(id));
+
+        // Grantor's balance freezes after revoke
+        uint256 grantorBal = token.balanceOf(grantor);
+        _advanceDays(30);
+        assertEq(token.balanceOf(grantor), grantorBal);
+    }
+}
+
+// ================================================================
+//  ServiceCredit tests
+// ================================================================
+
+contract ServiceCreditTest is Test {
+    ServiceCredit public token;
+
+    address public owner    = makeAddr("owner");
+    address public operator = makeAddr("operator");
+    address public alice    = makeAddr("alice");
+    address public bob      = makeAddr("bob");
+
+    uint128 constant BASE_FEE    = 200 ether;
+    uint128 constant USAGE_RATE  = 10 ether;   // per unit
+    uint256 constant DAY         = 86_400;
+
+    function setUp() public {
+        _warpToDay(1000);
+        token = new ServiceCredit(owner, operator);
+    }
+
+    function _warpToDay(uint256 d) internal { vm.warp(d * DAY); }
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
+
+    function _mint(address user, uint128 amt) internal {
+        vm.prank(owner);
+        token.mint(user, amt);
+    }
+
+    function _createTier() internal returns (uint256 tierId) {
+        vm.prank(owner);
+        tierId = token.createTier("Basic", BASE_FEE, USAGE_RATE);
+    }
+
+    function _enroll(address user, uint256 tierId) internal {
+        bytes32 mid = keccak256(abi.encode(address(token), BASE_FEE));
+        vm.prank(user);
+        token.authorize(mid, 1);
+        vm.prank(user);
+        token.enroll(tierId);
+    }
+
+    // ── createTier and enroll ──
+
+    function test_ServiceCredit__createTier_storesTier() public {
+        uint256 tierId = _createTier();
+
+        (string memory name, uint128 baseFee, uint128 usageRate, bool active) = token.tiers(tierId);
+        assertEq(name, "Basic");
+        assertEq(baseFee, BASE_FEE);
+        assertEq(usageRate, USAGE_RATE);
+        assertTrue(active);
+        assertEq(token.tierCount(), 1);
+    }
+
+    function test_ServiceCredit__enroll_startsBaseFeeMandate() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+
+        _enroll(alice, tierId);
+
+        assertTrue(token.isEnrolled(alice));
+        assertEq(token.userTier(alice), tierId);
+        // First term deducted immediately
+        assertEq(token.balanceOf(alice), BASE_FEE * 4);
+    }
+
+    function test_ServiceCredit__enroll_revertsWhenAlreadyEnrolled() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 10);
+
+        bytes32 mid = keccak256(abi.encode(address(token), BASE_FEE));
+        vm.prank(alice);
+        token.authorize(mid, 2);
+
+        vm.prank(alice);
+        token.enroll(tierId);
+
+        vm.prank(alice);
+        vm.expectRevert(ServiceCredit.AlreadyEnrolled.selector);
+        token.enroll(tierId);
+    }
+
+    // ── chargeUsage deducts from balance ──
+
+    function test_ServiceCredit__chargeUsage_deductsFromBalance() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        uint256 balBefore = token.balanceOf(alice);
+        uint256 units = 3;
+        vm.prank(operator);
+        token.chargeUsage(alice, units);
+
+        uint128 expected = uint128(units) * USAGE_RATE;
+        assertEq(token.balanceOf(alice), balBefore - expected);
+    }
+
+    function test_ServiceCredit__chargeUsage_revertsWhenNotEnrolled() public {
+        vm.prank(operator);
+        vm.expectRevert(ServiceCredit.NotEnrolled.selector);
+        token.chargeUsage(alice, 1);
+    }
+
+    function test_ServiceCredit__chargeUsage_revertsWhenNotOperator() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        vm.prank(alice);
+        vm.expectRevert(SiphonToken.Unauthorized.selector);
+        token.chargeUsage(alice, 1);
+    }
+
+    // ── unenroll stops base fee ──
+
+    function test_ServiceCredit__unenroll_stopsMandateAndClearsTier() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        vm.prank(alice);
+        token.unenroll();
+
+        assertFalse(token.isEnrolled(alice));
+        assertEq(token.userTier(alice), 0);
+    }
+
+    function test_ServiceCredit__unenroll_freezesBalanceAfterRevoke() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        vm.prank(alice);
+        token.unenroll();
+
+        uint256 balAfterUnenroll = token.balanceOf(alice);
+        _advanceDays(60);
+        assertEq(token.balanceOf(alice), balAfterUnenroll);
+    }
+
+    function test_ServiceCredit__unenroll_revertsWhenNotEnrolled() public {
+        vm.prank(alice);
+        vm.expectRevert(ServiceCredit.NotEnrolled.selector);
+        token.unenroll();
+    }
+
+    // ── base fee decays over time; usage charges are instant ──
+
+    function test_ServiceCredit__baseFee_decaysEachTerm() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        uint256 balAfterEnroll = token.balanceOf(alice); // 4 terms remaining
+
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), balAfterEnroll - BASE_FEE);
+
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), balAfterEnroll - BASE_FEE * 2);
+    }
+
+    function test_ServiceCredit__chargeUsage_instantDeductionIndependentOfTerm() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        // Mid-term usage charge: deducted immediately (spend, not mandate)
+        _advanceDays(15);
+        uint256 balMidTerm = token.balanceOf(alice);
+
+        vm.prank(operator);
+        token.chargeUsage(alice, 5);
+
+        assertEq(token.balanceOf(alice), balMidTerm - 5 * USAGE_RATE);
+    }
+
+    // ── enroll after lapse works (no deadlock) ──
+
+    function test_ServiceCredit__enroll_worksAfterPreviousLapse() public {
+        uint256 tierId = _createTier();
+        // Only enough for 2 terms total (1 immediate + 1 period)
+        _mint(alice, BASE_FEE * 2);
+
+        bytes32 mid = keccak256(abi.encode(address(token), BASE_FEE));
+        vm.prank(alice);
+        token.authorize(mid, 1);
+
+        vm.prank(alice);
+        token.enroll(tierId);
+
+        // Advance past the funded period so the mandate lapses
+        _advanceDays(60);
+        assertFalse(token.isEnrolled(alice));
+
+        // Top up and re-enroll
+        _mint(alice, BASE_FEE * 4);
+
+        vm.prank(alice);
+        token.authorize(mid, 1);
+
+        // enroll() detects lapsed mandate and allows re-enrollment
+        vm.prank(alice);
+        token.enroll(tierId);
+
+        assertTrue(token.isEnrolled(alice));
+    }
+
+    // ── collect (harvest base fee revenue) ──
+
+    function test_ServiceCredit__collect_harvestsBaseFeeRevenue() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 5);
+        _enroll(alice, tierId);
+
+        _advanceDays(30);
+
+        uint256 preBal = token.balanceOf(address(token));
+        token.collect(tierId, 10);
+        uint256 postBal = token.balanceOf(address(token));
+
+        assertEq(postBal - preBal, BASE_FEE);
+    }
+
+    // ── full lifecycle: mint, enroll, use, charge, collect, unenroll ──
+
+    function test_ServiceCredit__lifecycle_mintEnrollUseCollectUnenroll() public {
+        uint256 tierId = _createTier();
+        _mint(alice, BASE_FEE * 6);
+
+        // Enroll
+        _enroll(alice, tierId);
+        assertTrue(token.isEnrolled(alice));
+        assertEq(token.balanceOf(alice), BASE_FEE * 5); // first term deducted
+
+        // Use 4 units mid-term
+        vm.prank(operator);
+        token.chargeUsage(alice, 4);
+        assertEq(token.balanceOf(alice), BASE_FEE * 5 - USAGE_RATE * 4);
+
+        // 1 term passes: base fee drains another period
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), BASE_FEE * 4 - USAGE_RATE * 4);
+
+        // Collect 1 epoch of base fee revenue
+        uint256 contractBalBefore = token.balanceOf(address(token));
+        token.collect(tierId, 5);
+        assertEq(token.balanceOf(address(token)) - contractBalBefore, BASE_FEE);
+
+        // Unenroll
+        vm.prank(alice);
+        token.unenroll();
+        assertFalse(token.isEnrolled(alice));
+
+        // Balance freezes
+        uint256 balAfterUnenroll = token.balanceOf(alice);
+        _advanceDays(30);
+        assertEq(token.balanceOf(alice), balAfterUnenroll);
+
+        // Owner withdraws revenue (base fee immediate payment + usage charges are in token's balance)
+        uint256 contractBal = token.balanceOf(address(token));
+        vm.prank(owner);
+        token.withdraw(owner, uint128(contractBal));
+        assertEq(token.balanceOf(owner), contractBal);
+    }
+}
+
+// ================================================================
+//  StreamingSubscription lapse tests
+// ================================================================
+
+contract StreamingSubscriptionLapseTest is Test {
+    SimpleSiphon public token;
+    StreamingSubscription public sub;
+
+    address owner_   = makeAddr("owner");
+    address subOwner = makeAddr("subOwner");
+    address alice    = makeAddr("alice");
+
+    uint128 constant BASIC_RATE   = 1000 ether;
+    uint128 constant PREMIUM_RATE = 2000 ether;
+    uint256 constant DAY          = 86_400;
+
+    function setUp() public {
+        vm.warp(1000 * DAY);
+        token = new SimpleSiphon(owner_);
+        sub   = new StreamingSubscription(address(token), subOwner);
+
+        vm.startPrank(owner_);
+        token.setScheduler(owner_);
+        token.setSpender(owner_);
+        vm.stopPrank();
+    }
+
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
+
+    function _mint(address user, uint128 amt) internal {
+        vm.prank(owner_);
+        token.mint(user, amt);
+    }
+
+    function _createBasicPlan() internal returns (uint256 planId) {
+        vm.prank(subOwner);
+        planId = sub.createPlan("Basic", BASIC_RATE);
+    }
+
+    function _createPremiumPlan() internal returns (uint256 planId) {
+        vm.prank(subOwner);
+        planId = sub.createPlan("Premium", PREMIUM_RATE);
+    }
+
+    function _subscribeWithFunds(address user, uint256 planId, uint128 rate, uint128 fundTerms) internal {
+        _mint(user, rate * fundTerms);
+        bytes32 mid = keccak256(abi.encode(address(sub), rate));
+        vm.prank(user);
+        token.authorize(mid, 1);
+        vm.prank(user);
+        sub.subscribe(planId);
+    }
+
+    // ── cancel works after mandate lapsed ──
+
+    function test_StreamingSubscription__cancel_worksAfterMandateLapsed() public {
+        uint256 planId = _createBasicPlan();
+        // Fund exactly 1 immediate + 1 period = 2 terms total; lapses after 30 days
+        _subscribeWithFunds(alice, planId, BASIC_RATE, 2);
+
+        _advanceDays(60); // mandate lapses
+
+        assertFalse(sub.hasAccess(alice));
+
+        // cancel() should not revert even though mandate has lapsed
+        vm.prank(alice);
+        sub.cancel();
+
+        assertEq(sub.userPlan(alice), 0);
+    }
+
+    // ── subscribe works after previous subscription lapsed (re-subscribe) ──
+
+    function test_StreamingSubscription__subscribe_worksAfterPreviousLapse() public {
+        uint256 planId = _createBasicPlan();
+        // 2 terms: lapses after 1 period
+        _subscribeWithFunds(alice, planId, BASIC_RATE, 2);
+
+        _advanceDays(60); // mandate lapses
+
+        assertFalse(sub.hasAccess(alice));
+        assertEq(sub.userPlan(alice), planId); // still recorded, just lapsed
+
+        // Re-subscribe: subscribe() clears lapsed entry and taps fresh
+        _mint(alice, BASIC_RATE * 4);
+        bytes32 mid = keccak256(abi.encode(address(sub), BASIC_RATE));
+        vm.prank(alice);
+        token.authorize(mid, 1);
+
+        vm.prank(alice);
+        sub.subscribe(planId);
+
+        assertTrue(sub.hasAccess(alice));
+        assertEq(sub.userPlan(alice), planId);
+    }
+
+    // ── changePlan works after old plan lapsed ──
+
+    function test_StreamingSubscription__changePlan_worksAfterOldPlanLapsed() public {
+        uint256 basicId   = _createBasicPlan();
+        uint256 premiumId = _createPremiumPlan();
+
+        // Subscribe to basic with just 2 terms so it lapses
+        _subscribeWithFunds(alice, basicId, BASIC_RATE, 2);
+
+        _advanceDays(60); // basic mandate lapses
+
+        assertFalse(sub.hasAccess(alice));
+
+        // Fund alice for premium plan and authorize
+        _mint(alice, PREMIUM_RATE * 4);
+        bytes32 premiumMid = keccak256(abi.encode(address(sub), PREMIUM_RATE));
+        vm.prank(alice);
+        token.authorize(premiumMid, 1);
+
+        // changePlan skips revoke on lapsed mandate, taps premium
+        vm.prank(alice);
+        sub.changePlan(premiumId);
+
+        assertEq(sub.userPlan(alice), premiumId);
+        assertTrue(sub.hasAccess(alice));
+    }
+}
+
+// ================================================================
+//  RentalAgreement lapse tests
+// ================================================================
+
+contract RentalAgreementLapseTest is Test {
+    SimpleSiphon public token;
+    RentalAgreement public rental;
+
+    address owner_   = makeAddr("owner");
+    address landlord = makeAddr("landlord");
+    address tenant1  = makeAddr("tenant1");
+
+    uint128 constant RENT    = 1000 ether;
+    uint128 constant DEPOSIT = 2000 ether;
+    uint256 constant DAY     = 86_400;
+
+    function setUp() public {
+        vm.warp(1000 * DAY);
+        token  = new SimpleSiphon(owner_);
+        rental = new RentalAgreement(address(token), landlord, RENT);
+
+        vm.startPrank(owner_);
+        token.setScheduler(owner_);
+        token.setSpender(owner_);
+        vm.stopPrank();
+    }
+
+    function _advanceDays(uint256 n) internal { vm.warp(block.timestamp + n * DAY); }
+
+    function _mint(address user, uint128 amt) internal {
+        vm.prank(owner_);
+        token.mint(user, amt);
+    }
+
+    function _addTenantWithDeposit(address tenant, uint128 deposit, uint128 fundTerms) internal {
+        _mint(tenant, RENT * fundTerms + deposit);
+        bytes32 mid = rental.mandateId();
+        vm.prank(tenant);
+        token.authorize(mid, 1);
+        if (deposit > 0) {
+            vm.prank(tenant);
+            token.approve(address(rental), deposit);
+        }
+        vm.prank(landlord);
+        rental.addTenant(tenant, 0, deposit);
+    }
+
+    // ── moveOut works after mandate lapsed ──
+
+    function test_RentalAgreement__moveOut_worksAfterMandateLapsed() public {
+        // 2 terms: lapses after 1 period
+        _addTenantWithDeposit(tenant1, 0, 2);
+
+        _advanceDays(60); // mandate lapses
+
+        assertFalse(rental.isCurrentOnRent(tenant1));
+
+        // moveOut should not revert even though mandate already lapsed
+        vm.prank(tenant1);
+        rental.moveOut();
+
+        // Mandate was already lapsed so isTapActive is false
+        assertFalse(token.isTapActive(tenant1, rental.mandateId()));
+    }
+
+    // ── endLease works after moveOut (deposit returned) ──
+
+    function test_RentalAgreement__endLease_returnsDepositAfterMoveOut() public {
+        _addTenantWithDeposit(tenant1, DEPOSIT, 5);
+
+        // Tenant moves out voluntarily
+        vm.prank(tenant1);
+        rental.moveOut();
+
+        uint256 balBefore = token.balanceOf(tenant1);
+
+        vm.prank(landlord);
+        rental.endLease(tenant1);
+
+        assertEq(token.balanceOf(tenant1) - balBefore, DEPOSIT);
+        (,,, bool active) = rental.leases(tenant1);
+        assertFalse(active);
+    }
+
+    // ── endLease works after mandate lapsed (deposit returned) ──
+
+    function test_RentalAgreement__endLease_returnsDepositAfterLapse() public {
+        // 2 terms: lapses after 1 period
+        _addTenantWithDeposit(tenant1, DEPOSIT, 2);
+
+        _advanceDays(60); // mandate lapses naturally
+
+        assertFalse(rental.isCurrentOnRent(tenant1));
+
+        uint256 balBefore = token.balanceOf(tenant1);
+
+        // endLease skips revoke (mandate already gone) and returns deposit
+        vm.prank(landlord);
+        rental.endLease(tenant1);
+
+        assertEq(token.balanceOf(tenant1) - balBefore, DEPOSIT);
+        (,,, bool active) = rental.leases(tenant1);
         assertFalse(active);
     }
 }

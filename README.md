@@ -188,6 +188,10 @@ See `src/example/README.md` for a detailed walkthrough organized by pattern (pay
 
 **Decay / burns** (`src/example/DecayToken.sol`). Deflationary token where holding costs something. Every holder gets a burn mandate (`beneficiary = address(0)`) on mint. Balance decays each term, reducing total supply. No beneficiary to harvest; the tokens just disappear. Shows `_tap` with burn mechanics, runway calculation, and admin exemption.
 
+**Vesting** (`src/example/Vesting.sol`). Token streaming / grant vesting. Grantor holds tokens, creates streams for recipients. The Vesting contract is the beneficiary (intermediary); it harvests then forwards to recipients. Shows the Sablier/Drips pattern as native mandates. Priority means earlier grants vest first if the grantor underfunds.
+
+**Service credits** (`src/example/ServiceCredit.sol`). Base subscription (mandate) + pay-per-use (spend) from one balance. Extends SiphonToken directly (IS the token). Shows how mandates and spend compose: both draw from the same principal, competing for the same pool.
+
 ## Tradeoffs
 
 **No on-chain transaction for payments.** Block explorers won't show a transfer event when a monthly payment "goes through." The `Settled` event fires when someone interacts with the user's account, but that could be days after the actual payment boundary. The payments are real; they're just computed, not transacted.
@@ -203,7 +207,7 @@ forge build
 forge test -vvv
 ```
 
-167 tests covering core mechanics, example contracts, edge cases, and fuzz.
+218 tests covering core mechanics, example contracts, edge cases, and fuzz.
 
 ## License
 

@@ -1,6 +1,6 @@
 # SiphonToken Examples
 
-Six contracts demonstrating how to build on SiphonToken. Each targets a different dimension of the mandate system. Read them in any order; the table below maps what you want to learn to which contract shows it.
+Eight contracts demonstrating how to build on SiphonToken. Each targets a different dimension of the mandate system. Read them in any order; the table below maps what you want to learn to which contract shows it.
 
 ## Dimensions
 
@@ -8,11 +8,15 @@ Six contracts demonstrating how to build on SiphonToken. Each targets a differen
 |---|---|---|
 | Payments to a beneficiary | StreamingSubscription, RentalAgreement | Beneficiary collects via `harvest()` |
 | Burn / demurrage | DecayToken | `beneficiary = address(0)`, tokens vanish |
-| One payer, many beneficiaries | Payroll | Employer balance decays across all salaries |
+| Token vesting / streaming | Vesting | Sablier-like streams as native mandates |
+| Subscription + usage | ServiceCredit | Base fee (mandate) + overage (spend) |
+| One payer, many beneficiaries | Payroll, Vesting | Employer/grantor balance decays across all streams |
 | Many payers, one beneficiary | RentalAgreement | All tenants share one mandateId; one `harvest()` call |
 | Many payers, pooled escrow | Timeshare + TimeshareEscrow | Members deposit into escrow; escrow gets tapped |
-| Admin-controlled (`_tap`/`_revoke`) | SimpleSiphon, DecayToken | No user authorization; admin taps directly |
-| User-authorized (`authorize`/`tap`) | StreamingSubscription | User pre-authorizes; beneficiary calls `tap()` |
+| Admin-controlled (`_tap`/`_revoke`) | SimpleSiphon, DecayToken, ServiceCredit | No user authorization; admin taps directly |
+| User-authorized (`authorize`/`tap`) | StreamingSubscription, Vesting | User pre-authorizes; beneficiary calls `tap()` |
+| Mandate + spend composition | ServiceCredit | Recurring base fee + one-time usage charges |
+| Token IS the protocol | ServiceCredit, DecayToken | Contract extends SiphonToken (not wrapping) |
 | Listener callbacks | Payroll | `IMandateListener` detects lapse |
 | Comp (free periods) | StreamingSubscription, Timeshare | Billing pauses N terms, resumes automatically |
 | Spend (one-time deduction) | SimpleSiphon | `_spend()` for marketplace-style purchases |
@@ -106,6 +110,50 @@ A deflationary token where holding costs something. Every holder gets a burn tap
 
 **Use cases:** Demurrage currencies, governance tokens that expire, protocol-native gas credits, time-limited rewards.
 
+## Vesting
+
+**File:** `Vesting.sol`
+
+**Pattern:** Token streaming / grant vesting via mandates. Sablier in 50 lines.
+
+A grantor holds tokens and creates vesting streams for recipients. The Vesting contract IS the beneficiary (it calls `tap()`, making itself `msg.sender` to the token). Revenue is harvested into the contract, then forwarded to recipients.
+
+1. Admin creates grants (recipient, rate per term, total terms)
+2. Grantor calls `token.authorize(mandateId(address(vesting), rate), 1)`
+3. Recipient calls `activate(grantId)` which taps the grantor
+4. Grantor's balance decays as all streams drain simultaneously
+5. Anyone calls `collect(grantId, maxEpochs)` to harvest and forward to recipient
+6. Admin calls `revokeGrant()` to stop future vesting (already-collected tokens kept)
+7. `isVesting(grantId)` checks stream status; `fundedTerms()` shows grantor runway
+
+**Key SiphonToken features used:** `authorize`, `tap`, `harvest`, `revoke`, `isTapActive`, `mandateId`, `funded`, priority
+
+**The pattern to internalize:** The contract that calls `tap()` IS the beneficiary. This means tokens flow to the contract first, then must be distributed. Different rates produce different mandateIds. If the grantor underfunds, earlier-activated grants get priority (first-tapped = first-paid).
+
+**Limitation:** Multiple grants at the same rate share one mandateId. One harvest collects for all of them. For production, ensure unique rates or add internal accounting for shared harvests.
+
+## ServiceCredit
+
+**File:** `ServiceCredit.sol`
+
+**Pattern:** Base subscription (mandate) + pay-per-use (spend) from one balance.
+
+A service where users hold credit tokens. A recurring base fee drains via mandate; usage charges deduct on demand via spend. This is the natural composition of SiphonToken's two deduction mechanisms.
+
+Unlike other examples that wrap an external SiphonToken, this contract extends SiphonToken directly (IS the token). This pattern makes sense when the service IS the credit system.
+
+1. Admin creates tiers (name, base fee per term, usage rate per unit)
+2. Admin mints credits to users
+3. User calls `enroll(tierId)` to start base subscription (must authorize first)
+4. Balance decays from base fee each term
+5. Operator calls `chargeUsage(user, units)` for on-demand deductions via `_spend`
+6. User calls `unenroll()` to stop base fee (handles lapsed state)
+7. `collect(tierId, maxEpochs)` harvests base fee revenue
+
+**Key SiphonToken features used:** `_tap`, `_spend`, `_revoke`, `_mint`, `authorize`, `harvest`, `isTapActive`, `_mandateId`
+
+**The pattern to internalize:** Mandates and spend draw from the same principal. A usage charge reduces the balance, which reduces funded periods, which can cause the base subscription mandate to lapse sooner. The two mechanisms compose naturally but compete for the same pool.
+
 ## Timeshare + TimeshareEscrow
 
 **Files:** `Timeshare.sol`, `TimeshareEscrow.sol`
@@ -164,3 +212,7 @@ When building on SiphonToken:
 **Guarding revoke calls.** Since lapse deletes the tap, calling `revoke()` on an already-lapsed mandate reverts with `TapNotFound`. Any wrapper that calls `revoke()` must check `isTapActive()` first. This is the most common footgun when building on SiphonToken. See `StreamingSubscription.cancel()` and `RentalAgreement.moveOut()` for the pattern.
 
 **Re-tapping.** After revoke or lapse, the same mandateId can be re-tapped if the user re-authorizes. The tap record is deleted on revoke, not just marked inactive. This enables subscription renewal without changing the mandateId.
+
+**Who is the beneficiary?** Whoever calls `tap()` is `msg.sender` to the token and becomes the beneficiary. If your contract calls `tap()`, your contract IS the beneficiary (not the end user). Tokens from `harvest()` go to your contract; you must forward them. See `Vesting.collect()` for this pattern. If you want the end user to be the beneficiary, they must call `tap()` directly on the token (Payroll pattern).
+
+**Extending vs wrapping.** Most examples wrap an external SiphonToken. `ServiceCredit` and `DecayToken` extend SiphonToken directly (IS the token). Extending gives access to internal methods (`_tap`, `_spend`, `_mint`) without authorization overhead, but means one contract = one token. Wrapping keeps concerns separate and lets multiple services share one token.
