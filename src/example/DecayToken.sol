@@ -17,59 +17,55 @@ import {SiphonToken} from "../SiphonToken.sol";
  *      - No harvest. Burns are tracked via totalBurned, not a checkpoint.
  *      - _tap is called internally (no authorization needed)
  *      - Users can top up (receive more tokens) to extend their runway
+ *      - DECAY_RATE is immutable: all holders decay at the same rate.
+ *        A mutable rate would create double-tap footguns when users minted
+ *        before and after a rate change end up with two burn mandates.
  */
 contract DecayToken is SiphonToken {
     address public owner;
-    uint128 public decayRate;
 
-    event DecayRateSet(uint128 rate);
+    /// @notice Tokens burned per term per holder. Immutable: set at construction.
+    uint128 public immutable DECAY_RATE;
 
     error NoDecayRate();
 
     modifier onlyOwner() { if (msg.sender != owner) revert Unauthorized(); _; }
 
     /// @param _termDays  Billing interval (e.g. 30 for monthly decay).
-    /// @param _decayRate Tokens burned per term per holder. 0 = set later via setDecayRate.
+    /// @param _decayRate Tokens burned per term per holder. Must be > 0.
     constructor(uint16 _termDays, uint128 _decayRate) SiphonToken(0, _termDays, 32) {
+        if (_decayRate == 0) revert NoDecayRate();
         owner = msg.sender;
-        decayRate = _decayRate;
+        DECAY_RATE = _decayRate;
     }
 
     function name() external pure returns (string memory) { return "DecayToken"; }
     function symbol() external pure returns (string memory) { return "DECAY"; }
     function decimals() external pure returns (uint8) { return 18; }
 
-    /// @notice Update the decay rate for future mints. Does not affect existing holders.
-    function setDecayRate(uint128 _rate) external onlyOwner {
-        decayRate = _rate;
-        emit DecayRateSet(_rate);
-    }
-
     /// @notice Mint tokens to a user and apply the burn mandate. Balance starts
-    ///         decaying immediately. If the user already has a burn tap at the
-    ///         current rate, just tops up their balance (extends runway).
+    ///         decaying immediately. If the user already has a burn tap,
+    ///         just tops up their balance (extends runway).
     function mint(address _user, uint128 _amount) external onlyOwner {
-        if (decayRate == 0) revert NoDecayRate();
-
         _mint(_user, _amount);
 
         // Apply burn tap if not already active
-        bytes32 mid = _mandateId(address(0), decayRate);
+        bytes32 mid = _mandateId(address(0), DECAY_RATE);
         if (_taps[_user][mid].rate == 0) {
-            _tap(_user, address(0), decayRate);
+            _tap(_user, address(0), DECAY_RATE);
         }
     }
 
     /// @notice How many terms until a user's balance is fully burned.
     function runway(address _user) external view returns (uint256) {
-        bytes32 mid = _mandateId(address(0), decayRate);
+        bytes32 mid = _mandateId(address(0), DECAY_RATE);
         if (_taps[_user][mid].rate == 0) return 0;
         return _funded(_accounts[_user]);
     }
 
     /// @notice Remove a user's burn mandate. Admin escape hatch.
     function exempt(address _user) external onlyOwner {
-        bytes32 mid = _mandateId(address(0), decayRate);
+        bytes32 mid = _mandateId(address(0), DECAY_RATE);
         _revoke(_user, mid);
     }
 }

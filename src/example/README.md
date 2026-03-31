@@ -32,13 +32,15 @@ This is the flagship example and the closest to a "hello world." A subscription 
 4. Balance decays automatically each term. No transactions.
 5. `hasAccess(user)` checks `isTapActive` for gating
 6. Admin can `comp(user, planId, months)` for free periods
-7. User can `cancel()` which revokes the mandate
-8. Admin can `changePlan()` (revoke old + tap new)
+7. User can `cancel()` which revokes the mandate (or clears lapsed state)
+8. User can `changePlan()` (revoke old + tap new, requires new authorization)
 9. Anyone calls `collect(planId, maxEpochs)` to harvest revenue
 
 **Key SiphonToken features used:** `authorize`, `tap`, `revoke`, `comp`, `harvest`, `isTapActive`, `mandateId`
 
-**The pattern to internalize:** The service contract is the beneficiary (`msg.sender` on `tap()`). The mandateId locks in both the beneficiary address AND the rate. Changing either requires a new mandate.
+**Lapse handling.** When a user runs out of funds, their mandate is deleted by SiphonToken's priority resolution. The contract handles this: `cancel()` checks `isTapActive` before calling `revoke()` (skips if already lapsed), and `subscribe()` detects stale subscriptions and allows re-subscribe.
+
+**The pattern to internalize:** The service contract is the beneficiary (`msg.sender` on `tap()`). The mandateId locks in both the beneficiary address AND the rate. Changing either requires a new mandate. Always guard `revoke()` calls with `isTapActive` checks to handle lapse gracefully.
 
 ## Payroll
 
@@ -71,11 +73,12 @@ All tenants pay the same rent to the same beneficiary contract. Since `mandateId
 1. Landlord calls `addTenant(tenant, endDay, deposit)` which taps the tenant
 2. Tenant authorized the mandate beforehand
 3. `collectRent(maxEpochs)` harvests all tenants at once
-4. Tenant can `moveOut()` (self-revoke)
-5. Landlord calls `endLease()` to revoke (if needed) and return deposit
+4. Tenant can `moveOut()` to stop paying (revokes mandate if active, no-op if lapsed)
+5. Landlord calls `endLease()` to finalize and return deposit (handles both active and moved-out tenants)
 
 Also demonstrates:
 - Security deposits as separate token transfers (not mandate principal)
+- Two-phase exit: `moveOut()` stops billing, `endLease()` returns deposit
 - `checkDelinquencies()` iterating tenants to flag lapsed mandates
 - Lease terms as wrapper state alongside mandate state
 
@@ -89,11 +92,13 @@ Also demonstrates:
 
 A deflationary token where holding costs something. Every holder gets a burn tap (`beneficiary = address(0)`) applied on mint. Their balance decays each term, reducing `totalSupply`. No one harvests; the tokens just disappear.
 
-1. Admin sets `decayRate` (tokens burned per term)
+1. `DECAY_RATE` set at construction (immutable: all holders decay at the same rate)
 2. `mint(user, amount)` mints tokens AND applies burn tap if not present
 3. Balance decays automatically. `runway(user)` shows terms remaining.
 4. Additional mints extend runway (more principal, same burn rate)
 5. `exempt(user)` removes the burn tap (admin escape hatch)
+
+**Why immutable?** A mutable decay rate creates a double-tap footgun: a user minted at rate X, then minted again after rate changes to Y, would get two burn mandates draining at X + Y. Immutable rate avoids this entirely.
 
 **Key SiphonToken features used:** `_tap` (internal, admin-controlled), `_revoke`, `_mint`, `_mandateId`, `_funded`, burn mechanics (`beneficiary = address(0)`, `totalBurned`)
 
@@ -155,5 +160,7 @@ When building on SiphonToken:
 **Transfer hooks.** `_beforeTransfer` only fires on `transfer()` and `transferFrom()`. Internal operations (tap first-term payment, settle, harvest) bypass it. Don't rely on transfer hooks for accounting that needs to capture mandate flows.
 
 **Lapse vs revoke.** Lapse: funds ran out, resolved on next interaction (settle/tap/spend/transfer). Revoke: explicit termination. Both delete the tap. Both preserve bucket entries for historical harvest. But lapse is lazy (might not be "detected" until later), while revoke is immediate.
+
+**Guarding revoke calls.** Since lapse deletes the tap, calling `revoke()` on an already-lapsed mandate reverts with `TapNotFound`. Any wrapper that calls `revoke()` must check `isTapActive()` first. This is the most common footgun when building on SiphonToken. See `StreamingSubscription.cancel()` and `RentalAgreement.moveOut()` for the pattern.
 
 **Re-tapping.** After revoke or lapse, the same mandateId can be re-tapped if the user re-authorizes. The tap record is deleted on revoke, not just marked inactive. This enables subscription renewal without changing the mandateId.

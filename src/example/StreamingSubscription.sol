@@ -56,10 +56,19 @@ contract StreamingSubscription {
 
     /// @notice Subscribe to a plan. User must have called
     ///         token.authorize(mandateId, 1) first.
+    ///         If the user had a previous subscription that lapsed (ran out of
+    ///         funds), it is automatically cleared so they can re-subscribe.
     function subscribe(uint256 _planId) external {
         Plan storage plan = plans[_planId];
         if (!plan.active || plan.rate == 0) revert InvalidPlan();
-        if (userPlan[msg.sender] != 0) revert AlreadySubscribed();
+
+        uint256 oldPlanId = userPlan[msg.sender];
+        if (oldPlanId != 0) {
+            // Allow re-subscribe if old subscription lapsed
+            Plan storage oldPlan = plans[oldPlanId];
+            bytes32 oldMid = token.mandateId(address(this), oldPlan.rate);
+            if (token.isTapActive(msg.sender, oldMid)) revert AlreadySubscribed();
+        }
 
         userPlan[msg.sender] = _planId;
         token.tap(msg.sender, plan.rate);
@@ -67,8 +76,9 @@ contract StreamingSubscription {
         emit Subscribed(msg.sender, _planId);
     }
 
-    /// @notice Upgrade or downgrade to a different plan. Revokes old mandate,
-    ///         taps new one. User must have authorized the new mandateId.
+    /// @notice Upgrade or downgrade to a different plan. Revokes old mandate
+    ///         (if still active), taps new one. User must have authorized
+    ///         the new mandateId. Works even if old subscription lapsed.
     function changePlan(uint256 _newPlanId) external {
         uint256 oldPlanId = userPlan[msg.sender];
         if (oldPlanId == 0) revert NotSubscribed();
@@ -77,9 +87,11 @@ contract StreamingSubscription {
         Plan storage newPlan = plans[_newPlanId];
         if (!newPlan.active || newPlan.rate == 0) revert InvalidPlan();
 
-        // Revoke old mandate
+        // Revoke old mandate if still active (skip if lapsed)
         bytes32 oldMid = token.mandateId(address(this), oldPlan.rate);
-        token.revoke(msg.sender, oldMid);
+        if (token.isTapActive(msg.sender, oldMid)) {
+            token.revoke(msg.sender, oldMid);
+        }
 
         // Tap new mandate
         userPlan[msg.sender] = _newPlanId;
@@ -88,14 +100,20 @@ contract StreamingSubscription {
         emit PlanChanged(msg.sender, oldPlanId, _newPlanId);
     }
 
-    /// @notice Cancel subscription. User or this contract can revoke.
+    /// @notice Cancel subscription. Works whether the mandate is active or
+    ///         already lapsed (ran out of funds). Revokes if still active.
     function cancel() external {
         uint256 planId = userPlan[msg.sender];
         if (planId == 0) revert NotSubscribed();
 
         Plan storage plan = plans[planId];
         bytes32 mid = token.mandateId(address(this), plan.rate);
-        token.revoke(msg.sender, mid);
+
+        // Revoke if mandate is still active (skip if already lapsed)
+        if (token.isTapActive(msg.sender, mid)) {
+            token.revoke(msg.sender, mid);
+        }
+
         userPlan[msg.sender] = 0;
 
         emit Canceled(msg.sender, planId);

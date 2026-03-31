@@ -164,12 +164,15 @@ contract Timeshare {
     // ──────────────────────────────────────────────
 
     /// @notice Revoke an agreement mid-season. Stops billing immediately.
+    ///         If the mandate already lapsed, just marks inactive.
     function revokeAgreement(uint256 _agreementId) external onlyOwner {
         Agreement storage a = agreements[_agreementId];
         if (!a.active) revert NotActive();
 
         bytes32 mid = token.mandateId(address(this), a.rate);
-        token.revoke(a.escrow, mid);
+        if (token.isTapActive(a.escrow, mid)) {
+            token.revoke(a.escrow, mid);
+        }
         a.active = false;
 
         emit Revoked(_agreementId, a.season);

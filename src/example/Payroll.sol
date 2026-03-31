@@ -33,6 +33,9 @@ contract Payroll is IMandateListener {
     }
 
     mapping(address => Employee) public employees;
+    /// @dev Roster is append-only; terminated employees remain. In production,
+    ///      cap the array or swap-and-pop on terminate to bound gas for views
+    ///      like totalPayroll() that iterate the full roster.
     address[] public roster;
 
     event Hired(address indexed employee, string title, uint128 salary);

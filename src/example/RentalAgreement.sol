@@ -26,10 +26,13 @@ contract RentalAgreement {
     }
 
     mapping(address => Lease) public leases;
+    /// @dev Append-only; ended leases remain. In production, cap the array
+    ///      or swap-and-pop on endLease to bound gas for checkDelinquencies().
     address[] public tenants;
 
     event LeaseStarted(address indexed tenant, uint32 startDay, uint32 endDay, uint128 deposit);
     event LeaseEnded(address indexed tenant);
+    event MovedOut(address indexed tenant);
     event Delinquent(address indexed tenant);
 
     error Unauthorized();
@@ -116,16 +119,19 @@ contract RentalAgreement {
 
     // ── Tenant flow ──
 
-    /// @notice Tenant can end their own lease (revoke their mandate).
-    ///         Deposit is NOT returned; landlord must call endLease for that.
+    /// @notice Tenant stops paying rent. Revokes mandate if still active (no-op
+    ///         if already lapsed). Lease stays active until landlord calls
+    ///         endLease to return deposit and finalize.
     function moveOut() external {
         Lease storage lease = leases[msg.sender];
         if (!lease.active) revert NotTenant();
 
         bytes32 mid = mandateId();
-        token.revoke(msg.sender, mid);
-        lease.active = false;
-        // Note: deposit held until landlord calls endLease
+        if (token.isTapActive(msg.sender, mid)) {
+            token.revoke(msg.sender, mid);
+        }
+
+        emit MovedOut(msg.sender);
     }
 
     // ── Views ──
