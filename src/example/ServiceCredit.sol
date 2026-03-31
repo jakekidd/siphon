@@ -150,6 +150,7 @@ contract ServiceCredit is SiphonToken {
     function collect(uint256 _tierId, uint256 _maxEpochs) external {
         Tier storage tier = tiers[_tierId];
         if (tier.baseFee == 0) revert InvalidTier();
+        // External self-call: harvest() is external-only on SiphonToken
         this.harvest(address(this), tier.baseFee, _maxEpochs);
     }
 

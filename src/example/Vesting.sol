@@ -74,6 +74,8 @@ contract Vesting {
     ///         token.authorize(mandateId(address(this), rate), 1) to permit
     ///         activation. The grantor must hold enough tokens to cover
     ///         rate * terms.
+    /// @dev    Multiple grants at the same rate share one mandateId. Avoid
+    ///         duplicate rates or add internal accounting for production use.
     function createGrant(
         address _recipient,
         uint128 _rate,
