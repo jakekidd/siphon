@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-import {SimpleLite} from "../src/example/SimpleLite.sol";
-import {SiphonLite} from "../src/SiphonLite.sol";
+import {SimpleLite} from "../src/token/example/SimpleLite.sol";
+import {SiphonLite} from "../src/token/SiphonLite.sol";
 import {Test} from "forge-std/Test.sol";
 
 contract SiphonLiteTest is Test {

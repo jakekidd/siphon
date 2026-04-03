@@ -1,10 +1,30 @@
-# SiphonToken
+# Siphon
+
+Recurring payments without recurring transactions. Two products, one mandate model.
+
+## Products
+
+**SiphonToken** (`src/token/`): ERC20 where `balanceOf` decays via mandates. Zero gas per payment period. Payments are computed, not transacted. For protocol tokens and closed ecosystems.
+
+**SiphonWallet** (`src/wallet/`): Smart wallet where mandates are warrants authorizing payees to collect from any ERC20. Real transfers on collect. For end users paying in existing tokens (USDC, etc.).
+
+| | SiphonToken | SiphonWallet |
+|---|---|---|
+| Works with | Custom token (extends SiphonToken) | Any ERC20 |
+| Payment model | Lazy: balanceOf decreases automatically | Pull: payee calls collect() |
+| Gas per period | Zero (computed in balanceOf) | One transfer per collection |
+| Tx visibility | No Transfer event until settle/harvest | Real Transfer on every payment |
+| Transfer restrictions | Optional (_beforeTransfer hook) | None (standard wallet) |
+| Insolvency | Priority-based lapse | Partial payment; payee's loss |
+| Best for | Protocol tokens, batch harvest at scale | End users, any-token payments |
+
+---
+
+## SiphonToken
 
 ERC20 with autopay. Your token balance decays over time; no transactions required.
 
-Think of it as money that automatically pays your bills for you, with itself.
-
-## What is this
+### What is this
 
 SiphonToken is an ERC20 where `balanceOf` is a mathematical function of time, not a stored value (it references a stored principal and calculates what's been consumed by active autopayments whenever it's read). There are no transactions for recurring payments. The balance just ticks down at period boundaries, automatically, forever, until the **mandate** is revoked or funds run out.
 
@@ -14,7 +34,7 @@ The same balance also supports one-time deductions via **spend**: marketplace pu
 
 This isn't a protocol you deposit into. The token IS the protocol. Recurring payments are a native property of the token itself.
 
-## Glossary
+### Glossary
 
 | Term | Definition |
 |---|---|
@@ -30,7 +50,7 @@ This isn't a protocol you deposit into. The token IS the protocol. Recurring pay
 
 See NatSpec on `tap()`, `harvest()`, `comp()`, `revoke()`, and `authorize()` for detailed mechanics.
 
-## Configuration
+### Configuration
 
 Three immutables set at construction. Choose wisely; they're permanent.
 
@@ -45,7 +65,7 @@ Three immutables set at construction. Choose wisely; they're permanent.
 constructor() SiphonToken(0, 30, 32) {}
 ```
 
-## Mandate lifecycle
+### Mandate lifecycle
 
 ```
 1. User:        token.authorize(mandateId, 1)
@@ -66,9 +86,9 @@ constructor() SiphonToken(0, 30, 32) {}
 7. Renewal:     user re-authorizes, beneficiary re-taps
 ```
 
-## Implementing a service
+### Implementing a service
 
-The token contract is the bank. Your contract is the service. Here's the pattern using `StreamingSubscription` (see `src/example/StreamingSubscription.sol` for the full source):
+The token contract is the bank. Your contract is the service. Here's the pattern using `StreamingSubscription` (see `src/token/example/StreamingSubscription.sol` for the full source):
 
 ```solidity
 contract StreamingSubscription {
@@ -99,22 +119,6 @@ contract StreamingSubscription {
         return token.isTapActive(_user, mid);
     }
 
-    // Upgrade or downgrade: revoke old mandate, tap new one
-    function changePlan(uint256 _newPlanId) external {
-        Plan storage oldPlan = plans[userPlan[msg.sender]];
-        Plan storage newPlan = plans[_newPlanId];
-        bytes32 oldMid = token.mandateId(address(this), oldPlan.rate);
-        token.revoke(msg.sender, oldMid);     // revoke old
-        token.tap(msg.sender, newPlan.rate);   // tap new
-        userPlan[msg.sender] = _newPlanId;
-    }
-
-    // Gift 3 months free (billing pauses, resumes automatically)
-    function comp(address _user, uint256 _planId, uint16 _months) external onlyOwner {
-        Plan storage plan = plans[_planId];
-        token.comp(_user, plan.rate, _months);
-    }
-
     // Collect revenue
     function collect(uint256 _planId, uint256 _maxEpochs) external {
         token.harvest(address(this), plans[_planId].rate, _maxEpochs);
@@ -124,7 +128,7 @@ contract StreamingSubscription {
 
 The key pattern: the service contract IS the beneficiary (`msg.sender` on `tap()` and the address in `harvest()`). The user authorizes the mandateId which locks in both the beneficiary address and the rate. The service wraps mandates with its own product logic (plans, access gating, upgrades) without the token knowing or caring what the service does.
 
-## Transfer restrictions
+### Transfer restrictions
 
 Transfers are open by default. Override `_beforeTransfer` to add restrictions:
 
@@ -135,79 +139,116 @@ function _beforeTransfer(address, address, uint256) internal view override {
 }
 ```
 
-This hooks into `_transfer`, which is called by `transfer()` and `transferFrom()`. Protocol internals (tap first-term, settle, harvest) manipulate principals directly and are unaffected. The hook only gates user-initiated ERC20 transfers.
-
-## Reading state
+### Reading state
 
 ```solidity
-// user's spendable balance (accounts for all active mandates)
-token.balanceOf(user)
-
-// user's account: principal, total outflow rate, settlement anchor
-(uint128 principal, uint128 outflow, uint32 anchor) = token.getAccount(user)
-
-// list of active mandate IDs for a user (ordered by priority)
-bytes32[] memory taps = token.getUserTaps(user)
-
-// details of a specific tap
-(uint128 rate, uint32 entryEpoch, uint32 exitEpoch) = token.getTap(user, mid)
-
-// whether any mandate is active and funded
-token.isActive(user)
-
-// whether a specific mandate is active and funded
-token.isTapActive(user, mid)
-
-// how many full terms the user can fund
-token.funded(user)
-
-// day when funds will be fully consumed
-token.expiryDay(user)
-
-// whether user is in a comp period (billing paused)
-token.isComped(user)
-
-// compute a mandateId
-token.mandateId(beneficiary, rate)
-
-// beneficiary's harvest checkpoint
-(uint32 lastEpoch, uint224 count) = token.getCheckpoint(mid)
-
-// current epoch number
-token.currentEpoch()
-
-// supply accounting
-token.totalSupply()    // totalMinted - totalBurned - totalSpent
-token.totalMinted      // cumulative tokens ever minted
-token.totalBurned      // cumulative tokens destroyed by burn mandates
-token.totalSpent       // cumulative tokens removed via _spend
+token.balanceOf(user)                    // spendable balance (accounts for all mandates)
+token.getAccount(user)                   // (principal, outflow, anchor)
+token.getUserTaps(user)                  // active mandate IDs (ordered by priority)
+token.getTap(user, mid)                  // (rate, entryEpoch, exitEpoch)
+token.isActive(user)                     // any mandate active and funded?
+token.isTapActive(user, mid)             // specific mandate active?
+token.funded(user)                       // full terms user can fund
+token.expiryDay(user)                    // day when funds run out
+token.isComped(user)                     // billing paused?
+token.mandateId(beneficiary, rate)       // compute a mandateId
+token.getCheckpoint(mid)                 // (lastEpoch, subscriberCount)
+token.currentEpoch()                     // current epoch index
+token.totalSupply()                      // totalMinted - totalBurned - totalSpent
 ```
 
-## Use cases and examples
+### Use cases and examples
 
-See `src/example/README.md` for a detailed walkthrough organized by pattern (payments vs burns, one-to-many vs many-to-one, admin vs user-authorized, etc.).
+See `src/token/example/README.md` for a detailed walkthrough organized by pattern (payments vs burns, one-to-many vs many-to-one, admin vs user-authorized, etc.).
 
-**Subscriptions** (`src/example/StreamingSubscription.sol`). Plans with named tiers, subscribe, upgrade/downgrade (revoke + re-tap), comp (free months), access gating via `isTapActive`, revenue collection per plan. The flagship example; covers the full lifecycle.
+**Subscriptions** (`src/token/example/StreamingSubscription.sol`). Plans, subscribe, upgrade/downgrade, comp, access gating, revenue collection.
 
-**Payroll** (`src/example/Payroll.sol`). Employer holds tokens; employees are beneficiaries at different salary rates. The employer's balance decays as salaries are paid. Employees call `token.tap()` and `token.harvest()` directly. The Payroll contract is bookkeeping: roster management, views, lapse detection via `IMandateListener`. Shows the "one payer, many beneficiaries" pattern with priority (if the company runs low, hire order determines who gets paid first).
+**Payroll** (`src/token/example/Payroll.sol`). One payer, many beneficiaries. Priority on lapse. Listener.
 
-**Rent** (`src/example/RentalAgreement.sol`). One landlord, many tenants, same rent rate. All tenants share the same mandateId (same beneficiary contract + same rate = same hash), so one `harvest()` call collects everyone's rent. Includes security deposit handling, lease terms, delinquency detection, and tenant self-move-out.
+**Rent** (`src/token/example/RentalAgreement.sol`). Many payers, one beneficiary. Shared mandateId. One harvest collects all.
 
-**Timeshare** (`src/example/Timeshare.sol` + `TimeshareEscrow.sol`). Rotating payment responsibility among multiple users. Two-contract architecture: Timeshare (manager/beneficiary) deploys a TimeshareEscrow per agreement. Members deposit their share into the escrow each season; the escrow gets tapped and its balance drains at rate-per-term. Round-robin access rotation, seasonal renewal with automatic leftover refunds, comp (property maintenance), and funding reclaim with deadlines. Shows the "many payers, one pool, one beneficiary" pattern.
+**Timeshare** (`src/token/example/Timeshare.sol`). Pooled escrow, rotating access, seasonal renewal.
 
-**Decay / burns** (`src/example/DecayToken.sol`). Deflationary token where holding costs something. Every holder gets a burn mandate (`beneficiary = address(0)`) on mint. Balance decays each term, reducing total supply. No beneficiary to harvest; the tokens just disappear. Shows `_tap` with burn mechanics, runway calculation, and admin exemption.
+**Decay** (`src/token/example/DecayToken.sol`). Burn mandates. Deflationary. Balance decays to zero.
 
-**Vesting** (`src/example/Vesting.sol`). Token streaming / grant vesting. Grantor holds tokens, creates streams for recipients. The Vesting contract is the beneficiary (intermediary); it harvests then forwards to recipients. Shows the Sablier/Drips pattern as native mandates. Priority means earlier grants vest first if the grantor underfunds.
+**Vesting** (`src/token/example/Vesting.sol`). Token streaming. Sablier/Drips pattern as native mandates.
 
-**Service credits** (`src/example/ServiceCredit.sol`). Base subscription (mandate) + pay-per-use (spend) from one balance. Extends SiphonToken directly (IS the token). Shows how mandates and spend compose: both draw from the same principal, competing for the same pool.
+**Service credits** (`src/token/example/ServiceCredit.sol`). Base subscription (mandate) + usage charges (spend).
 
-## Tradeoffs
+### Tradeoffs
 
 **No on-chain transaction for payments.** Block explorers won't show a transfer event when a monthly payment "goes through." The `Settled` event fires when someone interacts with the user's account, but that could be days after the actual payment boundary. The payments are real; they're just computed, not transacted.
 
-**Floating supply.** Between settlement and harvest, tokens exist in `totalSupply` that aren't in anyone's `balanceOf`. The user's balance already decreased (lazy math), but the beneficiary hasn't harvested yet. Correct accounting, just unfamiliar. Explorers may show a discrepancy.
+**Floating supply.** Between settlement and harvest, tokens exist in `totalSupply` that aren't in anyone's `balanceOf`. The user's balance already decreased (lazy math), but the beneficiary hasn't harvested yet. Correct accounting, just unfamiliar.
 
-**What IS visible.** `balanceOf` is always accurate. `isActive` and `isTapActive` give real-time status. `Tapped`, `Revoked`, `Settled`, and `Harvested` events provide a full audit trail. The state is all there; it's just lazily computed rather than eagerly transacted.
+**What IS visible.** `balanceOf` is always accurate. `isActive` and `isTapActive` give real-time status. `Tapped`, `Revoked`, `Settled`, and `Harvested` events provide a full audit trail.
+
+---
+
+## SiphonWallet
+
+Smart wallet with mandate-based recurring payments. Works with any ERC20.
+
+### What is this
+
+SiphonWallet is a smart wallet that holds ERC20 tokens and supports mandates. A mandate is a warrant: it authorizes a payee to collect a fixed amount of a specific token on a recurring schedule. The payee calls `collect()` to pull owed tokens. No lazy balance tricks: token balances are pristine until a real transfer fires on collection.
+
+### Mandate lifecycle
+
+```
+1. Owner:  wallet.grant(payee, token, rate, cadence, maxPeriods)
+   ; creates a mandate; first collection available after one full period
+2. Time passes. Debt accumulates (capped by maxPeriods if set).
+3. Anyone: wallet.collect(mandateId)
+   ; computes periods owed since last collection
+   ; transfers min(owed, balance) to payee
+   ; lastCollected advances by exact period multiples
+4. Owner:  wallet.cancel(mandateId)
+   ; deactivates; no further collection
+5. Owner:  wallet.execute(to, value, data)
+   ; arbitrary calls: transfers, approvals, DeFi, anything
+```
+
+### Design decisions
+
+**No lazy balanceOf.** The underlying token's `balanceOf` is untouched until `collect()` fires a real ERC20 transfer. Every payment is a visible on-chain transaction.
+
+**No transfer restrictions.** The wallet owner can freely spend all tokens. If they drain the wallet before the payee collects, that's the payee's problem. Mandates are warrants, not locks.
+
+**Debt stacking.** If the payee doesn't collect for 3 months, they can collect all 3 months in one call. `maxPeriods` caps this: set it to 1 and the payee must collect every period or the debt stops growing.
+
+**Period carry-over.** `lastCollected` advances by exact period multiples, not to today. 45 days on a 30-day cadence = 1 period collected, 15 days carry over. The partial period counts toward the next collection.
+
+**Permissionless collect.** Anyone can call `collect()`. Tokens always go to the payee. This allows keepers, crons, or the payee themselves to trigger collection.
+
+### Reading state
+
+```solidity
+wallet.debt(id)            // current owed amount (0 if cancelled)
+wallet.mandateInfo(id)     // full Mandate struct
+wallet.mandateCount()      // total mandates (including cancelled)
+```
+
+### Factory
+
+`SiphonFactory` deploys wallet instances and maintains a registry.
+
+```solidity
+factory.createWallet()              // deploy a wallet for msg.sender
+factory.wallets(owner)              // look up wallet address
+```
+
+---
+
+## Prior Art: ERC-1337
+
+Siphon shares the spirit of [ERC-1337](https://eips.ethereum.org/EIPS/eip-1337) (Subscriptions on the Blockchain, Gitcoin/ERC-948 working group) but diverges in implementation.
+
+**ERC-1337** uses signed meta-transactions stored off-chain and replayed by relayers each period. Each payment is a `transferFrom()` that costs gas. Requires relayer infrastructure and ERC20 allowance management.
+
+**SiphonToken** eliminates transactions entirely. Payments are computed as a mathematical function of time within `balanceOf`. Zero gas per payment period. The tradeoff: requires a custom token; can't pay with existing ERC20s like USDC. The payee collects via `harvest()` which batch-processes all subscribers in O(epochs), not O(subscribers).
+
+**SiphonWallet** is closer to ERC-1337's authorize-then-collect model, but: mandates are stored on-chain (not as signed meta-txs), debt stacking with configurable caps replaces the all-or-nothing replay model, no relayer is needed (payee calls `collect()` directly), and the wallet is a general-purpose smart account with `execute()` for arbitrary operations beyond payments.
 
 ## Build
 
@@ -216,7 +257,7 @@ forge build
 forge test -vvv
 ```
 
-218 tests covering core mechanics, example contracts, edge cases, and fuzz.
+281 tests: token mechanics, 8 example contracts, wallet mandates, factory.
 
 ## License
 

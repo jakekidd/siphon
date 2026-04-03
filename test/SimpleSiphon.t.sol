@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-import {SimpleSiphon} from "../src/example/SimpleSiphon.sol";
-import {StreamingSubscription} from "../src/example/StreamingSubscription.sol";
-import {Payroll} from "../src/example/Payroll.sol";
-import {RentalAgreement} from "../src/example/RentalAgreement.sol";
-import {Timeshare} from "../src/example/Timeshare.sol";
-import {TimeshareEscrow} from "../src/example/TimeshareEscrow.sol";
-import {DecayToken} from "../src/example/DecayToken.sol";
-import {Vesting} from "../src/example/Vesting.sol";
-import {ServiceCredit} from "../src/example/ServiceCredit.sol";
-import {SiphonToken} from "../src/SiphonToken.sol";
-import {IMandateListener} from "../src/interfaces/IMandateListener.sol";
+import {SimpleSiphon} from "../src/token/example/SimpleSiphon.sol";
+import {StreamingSubscription} from "../src/token/example/StreamingSubscription.sol";
+import {Payroll} from "../src/token/example/Payroll.sol";
+import {RentalAgreement} from "../src/token/example/RentalAgreement.sol";
+import {Timeshare} from "../src/token/example/Timeshare.sol";
+import {TimeshareEscrow} from "../src/token/example/TimeshareEscrow.sol";
+import {DecayToken} from "../src/token/example/DecayToken.sol";
+import {Vesting} from "../src/token/example/Vesting.sol";
+import {ServiceCredit} from "../src/token/example/ServiceCredit.sol";
+import {SiphonToken} from "../src/token/SiphonToken.sol";
+import {IMandateListener} from "../src/token/interfaces/IMandateListener.sol";
 import {Test} from "forge-std/Test.sol";
 
 // ──────────────────────────────────────────────
