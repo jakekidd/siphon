@@ -295,7 +295,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
      * @param _mid    mandateId = keccak256(beneficiary, rate).
      * @param _count  Number of taps authorized. 0 = revoke authorization.
      */
-    function authorize(bytes32 _mid, uint256 _count) external {
+    function authorize(bytes32 _mid, uint256 _count) external virtual {
         _authorizations[msg.sender][_mid] = _count;
         emit Authorized(msg.sender, _mid, _count);
     }
