@@ -752,7 +752,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
 
     /// @dev Full billing periods elapsed since the user's anchor. Returns 0 during
     ///      comp (anchor is in the future) and on the same day as last settlement.
-    function _periodsElapsed(address _user) internal view returns (uint256) {
+    function _periodsElapsed(address _user) internal view virtual returns (uint256) {
         uint32 anch = _anchor[_user];
         uint256 today = _today();
         if (today <= uint256(anch)) return 0;
@@ -890,7 +890,7 @@ abstract contract SiphonToken is IERC20, IERC20Metadata {
     /// @dev Update bucket exit epochs for all non-burn taps. Called after any
     ///      change to principal or outflow. Exit = anchorEpoch + 1 + funded.
     ///      Since all taps share principal/outflow, exit is the same for all.
-    function _recomputeAllExits(address _user) internal {
+    function _recomputeAllExits(address _user) internal virtual {
         Account storage a = _accounts[_user];
         bytes32[] storage taps = _userTaps[_user];
         uint256 baseEpoch = _anchorEpoch(_user);
